@@ -1,0 +1,966 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8" />
+  <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+  <title>Qwen CustomVoice Bridge Client</title>
+  <style>
+    :root {
+      --bg: #0a0f16;
+      --panel: #111b28;
+      --panel-2: #162436;
+      --text: #e7edf8;
+      --muted: #9db0c7;
+      --border: #2a3e57;
+      --accent: #58c8ff;
+      --accent-2: #81f2cd;
+      --warn: #ffc67a;
+      --error: #ff7373;
+    }
+
+    * { box-sizing: border-box; }
+
+    body {
+      margin: 0;
+      padding: 24px;
+      min-height: 100vh;
+      font-family: "IBM Plex Sans", "Segoe UI", sans-serif;
+      color: var(--text);
+      background:
+        radial-gradient(circle at 10% 0%, rgba(88, 200, 255, 0.14), transparent 42%),
+        radial-gradient(circle at 90% 100%, rgba(129, 242, 205, 0.12), transparent 42%),
+        var(--bg);
+    }
+
+    .container {
+      max-width: 1080px;
+      margin: 0 auto;
+      display: grid;
+      gap: 14px;
+    }
+
+    .panel {
+      background: linear-gradient(180deg, var(--panel), var(--panel-2));
+      border: 1px solid var(--border);
+      border-radius: 14px;
+      padding: 16px;
+    }
+
+    h1 {
+      margin: 0 0 8px;
+      letter-spacing: 0.02em;
+      font-size: 1.55rem;
+    }
+
+    h2 {
+      margin: 0 0 8px;
+      font-size: 1.06rem;
+    }
+
+    p {
+      margin: 0;
+      color: var(--muted);
+    }
+
+    label {
+      display: block;
+      color: var(--muted);
+      font-size: 0.9rem;
+      margin-bottom: 6px;
+    }
+
+    input,
+    textarea,
+    select,
+    button {
+      width: 100%;
+      border-radius: 10px;
+      border: 1px solid var(--border);
+      background: #0e1724;
+      color: var(--text);
+      font: inherit;
+      padding: 10px 12px;
+    }
+
+    textarea {
+      min-height: 130px;
+      resize: vertical;
+    }
+
+    button {
+      cursor: pointer;
+      font-weight: 600;
+      background: linear-gradient(180deg, #2477af, #1b5f8d);
+      border-color: #338dcb;
+    }
+
+    button.secondary {
+      background: linear-gradient(180deg, #244361, #1d354f);
+      border-color: #2f5a7d;
+    }
+
+    button.warn {
+      background: linear-gradient(180deg, #905f2d, #714820);
+      border-color: #b57e42;
+    }
+
+    button:disabled {
+      opacity: 0.65;
+      cursor: not-allowed;
+    }
+
+    .grid {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(0, 1fr));
+      gap: 12px;
+      margin-top: 12px;
+    }
+
+    .grid.small {
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+    }
+
+    @media (max-width: 980px) {
+      .grid,
+      .grid.small {
+        grid-template-columns: repeat(2, minmax(0, 1fr));
+      }
+    }
+
+    @media (max-width: 620px) {
+      .grid,
+      .grid.small {
+        grid-template-columns: 1fr;
+      }
+    }
+
+    .row {
+      display: grid;
+      grid-template-columns: repeat(3, minmax(0, 1fr));
+      gap: 10px;
+      margin-top: 12px;
+    }
+
+    @media (max-width: 760px) {
+      .row { grid-template-columns: 1fr; }
+    }
+
+    .stat-grid {
+      display: grid;
+      gap: 10px;
+      grid-template-columns: repeat(5, minmax(0, 1fr));
+      margin-top: 10px;
+    }
+
+    @media (max-width: 1080px) {
+      .stat-grid { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 700px) {
+      .stat-grid { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 520px) {
+      .stat-grid { grid-template-columns: 1fr; }
+    }
+
+    .stat {
+      background: rgba(8, 13, 20, 0.75);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+    }
+
+    .stat .k {
+      color: var(--muted);
+      font-size: 0.8rem;
+      margin-bottom: 4px;
+    }
+
+    .stat .v {
+      font-size: 1.06rem;
+      font-variant-numeric: tabular-nums;
+    }
+
+    .accent { color: var(--accent-2); }
+    .warn-text { color: var(--warn); }
+    .error { color: var(--error); }
+
+    .status {
+      margin-top: 10px;
+      min-height: 1.3em;
+      color: var(--muted);
+      font-size: 0.95rem;
+    }
+
+    .log {
+      margin-top: 10px;
+      min-height: 56px;
+      max-height: 180px;
+      overflow: auto;
+      white-space: pre-wrap;
+      background: rgba(8, 13, 20, 0.82);
+      border: 1px solid var(--border);
+      border-radius: 10px;
+      padding: 10px;
+      font-size: 0.85rem;
+      color: #a8b9cf;
+      font-family: "IBM Plex Mono", "Consolas", monospace;
+    }
+
+    .inline-toggle {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+      margin-top: 6px;
+      color: var(--muted);
+      font-size: 0.9rem;
+    }
+
+    .inline-toggle input {
+      width: auto;
+      padding: 0;
+      margin: 0;
+    }
+  </style>
+</head>
+<body>
+  <div class="container">
+    <section class="panel">
+      <h1>Qwen CustomVoice Bridge Client</h1>
+      <p>Dedicated live client for the CustomVoice model with speaker and style instruction controls.</p>
+
+      <form id="ttsForm">
+        <div class="grid">
+          <div>
+            <label for="baseUrl">Base URL</label>
+            <input id="baseUrl" value="http://localhost:8040" />
+          </div>
+          <div>
+            <label for="model">Model</label>
+            <input id="model" value="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" />
+          </div>
+          <div>
+            <label for="voice">Speaker (OpenAI voice field)</label>
+            <input id="voice" value="Ryan" />
+          </div>
+          <div>
+            <label for="responseFormat">Response Format</label>
+            <select id="responseFormat">
+              <option value="pcm" selected>pcm (lowest latency)</option>
+              <option value="wav">wav</option>
+            </select>
+          </div>
+        </div>
+
+        <div class="grid small">
+          <div>
+            <label for="speed">Speed (API field)</label>
+            <input id="speed" type="number" step="0.05" min="0.1" value="1.0" />
+          </div>
+          <div>
+            <label for="language">Language</label>
+            <input id="language" value="English" />
+          </div>
+          <div>
+            <label for="instruct">Instruction (style)</label>
+            <input id="instruct" value="very angry, livid" />
+          </div>
+        </div>
+
+        <div class="grid small">
+          <div>
+            <label for="maxChunkChars">Max chars per segment</label>
+            <input id="maxChunkChars" type="number" min="40" value="280" />
+          </div>
+          <div>
+            <label for="firstChunkChars">First-segment char cap (TTFB)</label>
+            <input id="firstChunkChars" type="number" min="20" value="110" />
+          </div>
+        </div>
+
+        <div class="inline-toggle">
+          <input id="segmentMode" type="checkbox" />
+          <label for="segmentMode" style="margin: 0;">Client-side segmentation (experimental). Prefer backend chunking for correctness.</label>
+        </div>
+
+        <div style="margin-top: 12px;">
+          <label for="prompt">Prompt</label>
+          <textarea id="prompt" required>And you know what? This cracks me up. I voted for you, and you pissed all over it. I am talking, and you are listening.</textarea>
+        </div>
+
+        <div class="row">
+          <button id="runBtn" type="submit">Run Custom Stream</button>
+          <button id="warmupBtn" class="secondary" type="button">Custom Warmup</button>
+          <button id="stopBtn" class="warn" type="button" disabled>Stop</button>
+        </div>
+      </form>
+
+      <div id="status" class="status">Idle</div>
+      <div id="log" class="log"></div>
+    </section>
+
+    <section class="panel">
+      <h2>Stats</h2>
+      <div class="stat-grid">
+        <div class="stat"><div class="k">HTTP status</div><div class="v" id="sHttp">-</div></div>
+        <div class="stat"><div class="k">Segments</div><div class="v" id="sSegments">-</div></div>
+        <div class="stat"><div class="k">TTFB headers</div><div class="v" id="sTtfbHeaders">-</div></div>
+        <div class="stat"><div class="k">TTFB first chunk</div><div class="v" id="sTtfbChunk">-</div></div>
+        <div class="stat"><div class="k">TTFB first audible</div><div class="v accent" id="sTtfbAudible">-</div></div>
+        <div class="stat"><div class="k">Total net time</div><div class="v" id="sTotal">-</div></div>
+        <div class="stat"><div class="k">Bytes received</div><div class="v" id="sBytes">-</div></div>
+        <div class="stat"><div class="k">Audio seconds</div><div class="v" id="sAudioSec">-</div></div>
+        <div class="stat"><div class="k">RTF (time/audio)</div><div class="v" id="sRtf">-</div></div>
+        <div class="stat"><div class="k">Realtime x</div><div class="v" id="sRtX">-</div></div>
+        <div class="stat"><div class="k">Queue depth</div><div class="v" id="sQueue">-</div></div>
+        <div class="stat"><div class="k">Throughput</div><div class="v" id="sThroughput">-</div></div>
+        <div class="stat"><div class="k">Signal peak</div><div class="v" id="sPeak">-</div></div>
+      </div>
+      <p style="margin-top: 10px;" class="warn-text">Playback is scheduled progressively via Web Audio from streaming PCM bytes (not buffered-until-end).</p>
+    </section>
+  </div>
+
+  <script>
+    const DEFAULT_SAMPLE_RATE = 24000;
+    const DEFAULT_CHANNELS = 1;
+    const DEFAULT_BITS = 16;
+
+    const el = {
+      form: document.getElementById("ttsForm"),
+      baseUrl: document.getElementById("baseUrl"),
+      model: document.getElementById("model"),
+      voice: document.getElementById("voice"),
+      language: document.getElementById("language"),
+      instruct: document.getElementById("instruct"),
+      responseFormat: document.getElementById("responseFormat"),
+      speed: document.getElementById("speed"),
+      segmentMode: document.getElementById("segmentMode"),
+      maxChunkChars: document.getElementById("maxChunkChars"),
+      firstChunkChars: document.getElementById("firstChunkChars"),
+      prompt: document.getElementById("prompt"),
+      runBtn: document.getElementById("runBtn"),
+      warmupBtn: document.getElementById("warmupBtn"),
+      stopBtn: document.getElementById("stopBtn"),
+      status: document.getElementById("status"),
+      log: document.getElementById("log"),
+      sHttp: document.getElementById("sHttp"),
+      sSegments: document.getElementById("sSegments"),
+      sTtfbHeaders: document.getElementById("sTtfbHeaders"),
+      sTtfbChunk: document.getElementById("sTtfbChunk"),
+      sTtfbAudible: document.getElementById("sTtfbAudible"),
+      sTotal: document.getElementById("sTotal"),
+      sBytes: document.getElementById("sBytes"),
+      sAudioSec: document.getElementById("sAudioSec"),
+      sRtf: document.getElementById("sRtf"),
+      sRtX: document.getElementById("sRtX"),
+      sQueue: document.getElementById("sQueue"),
+      sThroughput: document.getElementById("sThroughput"),
+      sPeak: document.getElementById("sPeak")
+    };
+
+    const state = {
+      running: false,
+      abortController: null,
+      stopRequested: false,
+      audioCtx: null,
+      scheduledUntilSec: 0,
+      firstAudioScheduled: false,
+      stats: null,
+      requestStartMs: 0,
+      bytesPerSecond: DEFAULT_SAMPLE_RATE * DEFAULT_CHANNELS * (DEFAULT_BITS / 8),
+      sampleRate: DEFAULT_SAMPLE_RATE,
+      channels: DEFAULT_CHANNELS,
+      bitsPerSample: DEFAULT_BITS,
+      pcmRemainder: new Uint8Array(0),
+      wavHeaderBuffer: new Uint8Array(0),
+      wavHeaderDone: false
+    };
+
+    function nowMs() {
+      return performance.now();
+    }
+
+    function fmtMs(v) {
+      return Number.isFinite(v) ? `${v.toFixed(1)} ms` : "-";
+    }
+
+    function fmtSec(v) {
+      return Number.isFinite(v) ? `${v.toFixed(3)} s` : "-";
+    }
+
+    function fmtNum(v, digits = 3) {
+      return Number.isFinite(v) ? v.toFixed(digits) : "-";
+    }
+
+    function setStatus(text, cls = "") {
+      el.status.textContent = text;
+      el.status.className = `status ${cls}`.trim();
+    }
+
+    function appendLog(text) {
+      const stamp = new Date().toLocaleTimeString();
+      el.log.textContent += `[${stamp}] ${text}\n`;
+      el.log.scrollTop = el.log.scrollHeight;
+    }
+
+    function clearLog() {
+      el.log.textContent = "";
+    }
+
+    function newStats() {
+      return {
+        httpStatus: "-",
+        segments: 0,
+        ttfbHeadersMs: NaN,
+        ttfbChunkMs: NaN,
+        ttfbAudibleMs: NaN,
+        totalSec: NaN,
+        bytes: 0,
+        audioSec: 0,
+        rtf: NaN,
+        realtimeX: NaN,
+        queueDepthSec: 0,
+        throughputKibSec: NaN,
+        chunks: 0,
+        peak: 0
+      };
+    }
+
+    function updateStats() {
+      const s = state.stats || newStats();
+      el.sHttp.textContent = s.httpStatus;
+      el.sSegments.textContent = Number.isFinite(s.segments) ? String(s.segments) : "-";
+      el.sTtfbHeaders.textContent = fmtMs(s.ttfbHeadersMs);
+      el.sTtfbChunk.textContent = fmtMs(s.ttfbChunkMs);
+      el.sTtfbAudible.textContent = fmtMs(s.ttfbAudibleMs);
+      el.sTotal.textContent = fmtSec(s.totalSec);
+      el.sBytes.textContent = Number.isFinite(s.bytes) ? s.bytes.toLocaleString() : "-";
+      el.sAudioSec.textContent = fmtSec(s.audioSec);
+      el.sRtf.textContent = fmtNum(s.rtf);
+      el.sRtX.textContent = fmtNum(s.realtimeX);
+      el.sQueue.textContent = fmtMs((s.queueDepthSec || 0) * 1000);
+      el.sThroughput.textContent = Number.isFinite(s.throughputKibSec) ? `${s.throughputKibSec.toFixed(1)} KiB/s` : "-";
+      el.sPeak.textContent = Number.isFinite(s.peak) ? s.peak.toFixed(4) : "-";
+    }
+
+    async function ensureAudioContext() {
+      if (!state.audioCtx || state.audioCtx.state === "closed") {
+        state.audioCtx = new (window.AudioContext || window.webkitAudioContext)({ latencyHint: "interactive" });
+        state.scheduledUntilSec = state.audioCtx.currentTime;
+      }
+
+      if (state.audioCtx.state === "suspended") {
+        await state.audioCtx.resume();
+      }
+
+      return state.audioCtx;
+    }
+
+    async function hardStopAudio() {
+      if (!state.audioCtx) {
+        return;
+      }
+      try {
+        await state.audioCtx.close();
+      } catch (_) {
+        // Ignore.
+      }
+      state.audioCtx = null;
+      state.scheduledUntilSec = 0;
+      state.firstAudioScheduled = false;
+      state.pcmRemainder = new Uint8Array(0);
+      state.wavHeaderBuffer = new Uint8Array(0);
+      state.wavHeaderDone = false;
+    }
+
+    function resetStreamDecoders() {
+      state.pcmRemainder = new Uint8Array(0);
+      state.wavHeaderBuffer = new Uint8Array(0);
+      state.wavHeaderDone = false;
+    }
+
+    function parseWavHeader(bytes) {
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength < 44) {
+        return null;
+      }
+      const v = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+      const riff = String.fromCharCode(v.getUint8(0), v.getUint8(1), v.getUint8(2), v.getUint8(3));
+      const wave = String.fromCharCode(v.getUint8(8), v.getUint8(9), v.getUint8(10), v.getUint8(11));
+      if (riff !== "RIFF" || wave !== "WAVE") {
+        return null;
+      }
+      return {
+        channels: v.getUint16(22, true),
+        sampleRate: v.getUint32(24, true),
+        bitsPerSample: v.getUint16(34, true)
+      };
+    }
+
+    function splitIntoSentences(text) {
+      const cleaned = (text || "").trim();
+      if (!cleaned) {
+        return [];
+      }
+      const pattern = /(?<=[.!?])\s+(?=[A-Z"'(])|(?<=[.!?])(?=\s*$)|(?<=\.\.\.)\s+/g;
+      return cleaned.split(pattern).map((s) => s.trim()).filter(Boolean);
+    }
+
+    function splitLongText(input, cap) {
+      if (input.length <= cap) {
+        return [input];
+      }
+
+      const clauses = input.split(/(?<=[,;:])\s+/g).filter(Boolean);
+      const parts = [];
+
+      for (const clause of clauses) {
+        if (clause.length <= cap) {
+          parts.push(clause);
+          continue;
+        }
+
+        const words = clause.split(/\s+/g);
+        let current = "";
+        for (const w of words) {
+          const next = current ? `${current} ${w}` : w;
+          if (next.length > cap && current) {
+            parts.push(current);
+            current = w;
+          } else {
+            current = next;
+          }
+        }
+        if (current) {
+          parts.push(current);
+        }
+      }
+
+      return parts;
+    }
+
+    function buildSegments(text, maxChars, firstChunkChars, segmentedMode) {
+      const prompt = (text || "").trim();
+      if (!prompt) {
+        return [];
+      }
+      if (!segmentedMode) {
+        return [prompt];
+      }
+
+      const sentences = splitIntoSentences(prompt);
+      if (sentences.length === 0) {
+        return [prompt];
+      }
+
+      const safeMax = Math.max(40, maxChars || 280);
+      const firstCap = Math.max(20, Math.min(safeMax, firstChunkChars || safeMax));
+      const chunks = [];
+      let current = "";
+      let cap = firstCap;
+
+      for (const sentence of sentences) {
+        const sentenceParts = sentence.length > cap ? splitLongText(sentence, cap) : [sentence];
+        for (const partRaw of sentenceParts) {
+          const part = partRaw.trim();
+          if (!part) {
+            continue;
+          }
+
+          const candidate = current ? `${current} ${part}` : part;
+          if (candidate.length > cap && current) {
+            chunks.push(current.trim());
+            current = part;
+            cap = safeMax;
+          } else if (part.length > cap) {
+            if (current) {
+              chunks.push(current.trim());
+              current = "";
+            }
+            chunks.push(part);
+            cap = safeMax;
+          } else {
+            current = candidate;
+          }
+        }
+      }
+
+      if (current) {
+        chunks.push(current.trim());
+      }
+
+      return chunks.filter(Boolean);
+    }
+
+    function updateDerivedStats() {
+      const s = state.stats;
+      if (!s) {
+        return;
+      }
+
+      const elapsedSec = (nowMs() - state.requestStartMs) / 1000;
+      s.totalSec = elapsedSec;
+      s.audioSec = s.bytes / Math.max(1, state.bytesPerSecond);
+      s.rtf = s.audioSec > 0 ? elapsedSec / s.audioSec : NaN;
+      s.realtimeX = elapsedSec > 0 ? s.audioSec / elapsedSec : NaN;
+      s.throughputKibSec = elapsedSec > 0 ? (s.bytes / 1024) / elapsedSec : NaN;
+
+      if (state.audioCtx) {
+        s.queueDepthSec = Math.max(0, state.scheduledUntilSec - state.audioCtx.currentTime);
+      } else {
+        s.queueDepthSec = 0;
+      }
+    }
+
+    function queueFloat32(float32, sampleRate) {
+      if (!(float32 instanceof Float32Array) || float32.length === 0) {
+        return;
+      }
+
+      const ctx = state.audioCtx;
+      if (!ctx) {
+        return;
+      }
+
+      const buffer = ctx.createBuffer(1, float32.length, sampleRate);
+      buffer.copyToChannel(float32, 0);
+
+      const src = ctx.createBufferSource();
+      src.buffer = buffer;
+      src.connect(ctx.destination);
+
+      const nowSec = ctx.currentTime;
+      const startAt = Math.max(nowSec + 0.008, state.scheduledUntilSec);
+      src.start(startAt);
+      state.scheduledUntilSec = startAt + buffer.duration;
+
+      if (!state.firstAudioScheduled && state.stats) {
+        const predictedWallMs = nowMs() + Math.max(0, (startAt - nowSec) * 1000);
+        state.stats.ttfbAudibleMs = predictedWallMs - state.requestStartMs;
+        state.firstAudioScheduled = true;
+      }
+    }
+
+    function pcmBytesToFloat32(bytes) {
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+        return new Float32Array(0);
+      }
+
+      const merged = new Uint8Array(state.pcmRemainder.byteLength + bytes.byteLength);
+      merged.set(state.pcmRemainder, 0);
+      merged.set(bytes, state.pcmRemainder.byteLength);
+
+      const evenLength = merged.byteLength - (merged.byteLength % 2);
+      if (evenLength <= 0) {
+        state.pcmRemainder = merged;
+        return new Float32Array(0);
+      }
+
+      state.pcmRemainder = merged.slice(evenLength);
+
+      const view = new DataView(merged.buffer, merged.byteOffset, evenLength);
+      const sampleCount = evenLength / 2;
+      const out = new Float32Array(sampleCount);
+      let peak = 0;
+
+      for (let i = 0; i < sampleCount; i++) {
+        const s = view.getInt16(i * 2, true);
+        const v = Math.max(-1, Math.min(1, s / 32768));
+        out[i] = v;
+        const av = Math.abs(v);
+        if (av > peak) {
+          peak = av;
+        }
+      }
+      if (state.stats) {
+        state.stats.peak = Math.max(state.stats.peak || 0, peak);
+      }
+
+      return out;
+    }
+
+    function ingestWavBytes(chunk) {
+      if (state.wavHeaderDone) {
+        return chunk;
+      }
+
+      const merged = new Uint8Array(state.wavHeaderBuffer.byteLength + chunk.byteLength);
+      merged.set(state.wavHeaderBuffer, 0);
+      merged.set(chunk, state.wavHeaderBuffer.byteLength);
+
+      if (merged.byteLength < 44) {
+        state.wavHeaderBuffer = merged;
+        return new Uint8Array(0);
+      }
+
+      const header = merged.slice(0, 44);
+      const meta = parseWavHeader(header);
+      if (meta && meta.channels && meta.sampleRate && meta.bitsPerSample) {
+        state.channels = meta.channels;
+        state.sampleRate = meta.sampleRate;
+        state.bitsPerSample = meta.bitsPerSample;
+        state.bytesPerSecond = state.sampleRate * state.channels * (state.bitsPerSample / 8);
+      }
+
+      state.wavHeaderDone = true;
+      state.wavHeaderBuffer = new Uint8Array(0);
+
+      return merged.slice(44);
+    }
+
+    async function streamOneSegment(segmentText, segmentIndex, segmentCount) {
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      const speaker = el.voice.value.trim() || "Ryan";
+      const payload = {
+        model: el.model.value.trim(),
+        input: segmentText,
+        voice: speaker,
+        speaker,
+        language: el.language.value.trim() || "English",
+        instruct: el.instruct.value.trim(),
+        response_format: el.responseFormat.value,
+        speed: Number.parseFloat(el.speed.value || "1") || 1.0
+      };
+
+      const response = await fetch(`${baseUrl}/v1/audio/speech`, {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify(payload),
+        signal: state.abortController.signal
+      });
+
+      const headerAt = nowMs();
+      state.stats.httpStatus = response.status;
+      if (!Number.isFinite(state.stats.ttfbHeadersMs)) {
+        state.stats.ttfbHeadersMs = headerAt - state.requestStartMs;
+      }
+
+      if (!response.ok) {
+        const detail = await response.text();
+        if (response.status === 429 && state.stopRequested) {
+          throw new DOMException("Aborted", "AbortError");
+        }
+        throw new Error(`${response.status} ${response.statusText} ${detail}`.trim());
+      }
+
+      if (!response.body) {
+        throw new Error("Readable stream is not available in this browser.");
+      }
+
+      const hdrSampleRate = Number.parseInt(response.headers.get("X-Audio-Sample-Rate") || "0", 10);
+      const hdrChannels = Number.parseInt(response.headers.get("X-Audio-Channels") || "0", 10);
+      const hdrBits = Number.parseInt(response.headers.get("X-Audio-Bits-Per-Sample") || "0", 10);
+      if (hdrSampleRate > 0) state.sampleRate = hdrSampleRate;
+      if (hdrChannels > 0) state.channels = hdrChannels;
+      if (hdrBits > 0) state.bitsPerSample = hdrBits;
+      state.bytesPerSecond = state.sampleRate * state.channels * (state.bitsPerSample / 8);
+
+      resetStreamDecoders();
+      const reader = response.body.getReader();
+
+      appendLog(
+        `segment ${segmentIndex + 1}/${segmentCount} started (${segmentText.length} chars), speaker=${speaker}, language=${payload.language}`
+      );
+      setStatus(`Streaming segment ${segmentIndex + 1}/${segmentCount}...`);
+
+      while (true) {
+        const { done, value } = await reader.read();
+        if (done) {
+          break;
+        }
+
+        if (!Number.isFinite(state.stats.ttfbChunkMs)) {
+          state.stats.ttfbChunkMs = nowMs() - state.requestStartMs;
+        }
+
+        state.stats.chunks += 1;
+
+        let payloadBytes = value;
+        if (el.responseFormat.value === "wav") {
+          payloadBytes = ingestWavBytes(value);
+        }
+
+        if (payloadBytes.byteLength > 0) {
+          state.stats.bytes += payloadBytes.byteLength;
+          const float32 = pcmBytesToFloat32(payloadBytes);
+          if (float32.length > 0) {
+            queueFloat32(float32, state.sampleRate);
+          }
+        }
+
+        updateDerivedStats();
+        updateStats();
+      }
+
+      appendLog(`segment ${segmentIndex + 1}/${segmentCount} completed`);
+    }
+
+    async function runWarmup() {
+      if (state.running) {
+        return;
+      }
+
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      const speaker = el.voice.value.trim() || "Ryan";
+      const payload = {
+        model: el.model.value.trim(),
+        input: "hi",
+        voice: speaker,
+        speaker,
+        language: el.language.value.trim() || "English",
+        instruct: el.instruct.value.trim(),
+        response_format: "pcm",
+        speed: 1.0
+      };
+
+      setStatus("Running warmup...");
+      el.warmupBtn.disabled = true;
+
+      try {
+        const t0 = nowMs();
+        const resp = await fetch(`${baseUrl}/v1/audio/speech`, {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify(payload)
+        });
+
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
+        }
+
+        if (resp.body) {
+          const reader = resp.body.getReader();
+          for (let i = 0; i < 2; i++) {
+            const part = await reader.read();
+            if (part.done) {
+              break;
+            }
+          }
+          try { await reader.cancel(); } catch (_) {}
+        }
+
+        const ms = nowMs() - t0;
+        setStatus(`Warmup done (${ms.toFixed(1)} ms).`, "accent");
+        appendLog(`warmup done in ${ms.toFixed(1)} ms`);
+      } catch (error) {
+        setStatus(`Warmup failed: ${error.message}`, "error");
+        appendLog(`warmup failed: ${error.message}`);
+      } finally {
+        el.warmupBtn.disabled = false;
+      }
+    }
+
+    async function runStreaming() {
+      if (state.running) {
+        return;
+      }
+
+      const prompt = (el.prompt.value || "").trim();
+      if (!prompt) {
+        setStatus("Prompt is required.", "error");
+        return;
+      }
+
+      state.running = true;
+      state.abortController = new AbortController();
+      state.stopRequested = false;
+      state.stats = newStats();
+      state.requestStartMs = nowMs();
+      state.firstAudioScheduled = false;
+
+      clearLog();
+      updateStats();
+
+      el.runBtn.disabled = true;
+      el.warmupBtn.disabled = true;
+      el.stopBtn.disabled = false;
+
+      try {
+        await ensureAudioContext();
+
+        const maxChars = Number.parseInt(el.maxChunkChars.value || "280", 10);
+        const firstChunkChars = Number.parseInt(el.firstChunkChars.value || "110", 10);
+        const segmentedMode = Boolean(el.segmentMode.checked);
+
+        const segments = buildSegments(prompt, maxChars, firstChunkChars, segmentedMode);
+        state.stats.segments = segments.length;
+        updateStats();
+
+        appendLog(`stream mode: ${el.responseFormat.value}, segmented: ${segmentedMode}`);
+        appendLog(`segments: ${segments.length}`);
+
+        for (let i = 0; i < segments.length; i++) {
+          if (state.abortController.signal.aborted) {
+            throw new DOMException("Aborted", "AbortError");
+          }
+          await streamOneSegment(segments[i], i, segments.length);
+        }
+
+        updateDerivedStats();
+        updateStats();
+        setStatus("Stream complete.", "accent");
+      } catch (error) {
+        const aborted = (error && error.name === "AbortError") || state.stopRequested;
+        if (aborted) {
+          setStatus("Stream stopped.", "warn-text");
+          appendLog("stream aborted by user");
+        } else {
+          setStatus(`Stream failed: ${error.message}`, "error");
+          appendLog(`stream failed: ${error.message}`);
+        }
+      } finally {
+        state.running = false;
+        state.abortController = null;
+        state.stopRequested = false;
+        el.runBtn.disabled = false;
+        el.warmupBtn.disabled = false;
+        el.stopBtn.disabled = true;
+      }
+    }
+
+    async function stopStreaming() {
+      state.stopRequested = true;
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      let stopSent = false;
+      try {
+        await fetch(`${baseUrl}/v1/audio/stop`, { method: "POST" });
+        stopSent = true;
+      } catch (_) {
+        // Ignore stop endpoint failures; local abort still proceeds.
+      }
+      if (!stopSent && state.abortController) {
+        state.abortController.abort();
+      }
+      await hardStopAudio();
+      if (state.stats) {
+        updateDerivedStats();
+        updateStats();
+      }
+    }
+
+    el.form.addEventListener("submit", (event) => {
+      event.preventDefault();
+      runStreaming();
+    });
+
+    el.warmupBtn.addEventListener("click", () => {
+      runWarmup();
+    });
+
+    el.stopBtn.addEventListener("click", () => {
+      stopStreaming();
+    });
+
+    window.addEventListener("beforeunload", () => {
+      if (state.abortController) {
+        state.abortController.abort();
+      }
+      hardStopAudio();
+    });
+
+    state.stats = newStats();
+    updateStats();
+  </script>
+</body>
+</html>

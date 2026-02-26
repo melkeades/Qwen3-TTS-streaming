@@ -22,7 +22,7 @@ from qwen_tts import Qwen3TTSModel
 
 def main():
     device = "cuda:0"
-    MODEL_PATH = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice/"
+    MODEL_PATH = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
 
     tts = Qwen3TTSModel.from_pretrained(
         MODEL_PATH,
@@ -49,7 +49,10 @@ def main():
     sf.write("qwen3_tts_test_custom_single.wav", wavs[0], sr)
 
     # -------- Batch (some empty instruct) --------
-    texts = ["其实我真的有发现，我是一个特别善于观察别人情绪的人。", "She said she would be here by noon."]
+    texts = [
+        "其实我真的有发现，我是一个特别善于观察别人情绪的人。",
+        "She said she would be here by noon.",
+    ]
     languages = ["Chinese", "English"]
     speakers = ["Vivian", "Ryan"]
     instructs = ["", "Very happy."]

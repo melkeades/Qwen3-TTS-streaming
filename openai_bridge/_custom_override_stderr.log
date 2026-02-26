@@ -1,0 +1,5 @@
+INFO:     Started server process [48912]
+INFO:     Waiting for application startup.
+Fetching 4 files:   0%|          | 0/4 [00:00<?, ?it/s]Fetching 4 files: 100%|##########| 4/4 [00:00<00:00, 3979.42it/s]
+INFO:     Application startup complete.
+INFO:     Uvicorn running on http://0.0.0.0:8040 (Press CTRL+C to quit)

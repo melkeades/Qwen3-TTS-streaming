@@ -6,7 +6,7 @@ import time
 import torch
 from qwen_tts import Qwen3TTSModel
 
-torch.set_float32_matmul_precision('high')
+torch.set_float32_matmul_precision("high")
 
 
 def profile_generate():
@@ -158,8 +158,9 @@ def profile_generate():
             past_kv = out.past_key_values
 
             # 6 more forward calls
-            dummy_embed = torch.randn(1, 1, code_predictor.config.hidden_size,
-                                      device=device, dtype=dtype)
+            dummy_embed = torch.randn(
+                1, 1, code_predictor.config.hidden_size, device=device, dtype=dtype
+            )
             for _ in range(6):
                 out = code_predictor.model(
                     inputs_embeds=dummy_embed,
@@ -175,7 +176,10 @@ def profile_generate():
     print(f"  Min:  {min(times_7_forwards)*1000:.1f}ms")
     print(f"  Max:  {max(times_7_forwards)*1000:.1f}ms")
 
-    overhead = (sum(times_generate)/len(times_generate) - sum(times_7_forwards)/len(times_7_forwards)) * 1000
+    overhead = (
+        sum(times_generate) / len(times_generate)
+        - sum(times_7_forwards) / len(times_7_forwards)
+    ) * 1000
     print(f"\nHF generate() overhead: ~{overhead:.1f}ms per call")
 
     # Time main talker forward
@@ -192,7 +196,11 @@ def profile_generate():
     import time as _time
 
     # Patch to measure step time
-    original_forward = talker.forward.__wrapped__ if hasattr(talker.forward, '__wrapped__') else talker.forward
+    original_forward = (
+        talker.forward.__wrapped__
+        if hasattr(talker.forward, "__wrapped__")
+        else talker.forward
+    )
 
     print("\nMeasuring actual streaming step times...")
 

@@ -1,0 +1,18 @@
+{
+    "sourceFile": "examples/test_model_12hz_custom_voice.py",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1771042066138,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1771042066138,
+            "name": "Commit-0",
+            "content": "# coding=utf-8\n# Copyright 2026 The Alibaba Qwen team.\n# SPDX-License-Identifier: Apache-2.0\n#\n# Licensed under the Apache License, Version 2.0 (the \"License\");\n# you may not use this file except in compliance with the License.\n# You may obtain a copy of the License at\n#\n#     http://www.apache.org/licenses/LICENSE-2.0\n#\n# Unless required by applicable law or agreed to in writing, software\n# distributed under the License is distributed on an \"AS IS\" BASIS,\n# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.\n# See the License for the specific language governing permissions and\n# limitations under the License.\nimport time\nimport torch\nimport soundfile as sf\n\nfrom qwen_tts import Qwen3TTSModel\n\n\ndef main():\n    device = \"cuda:0\"\n    MODEL_PATH = \"Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice\"\n\n    tts = Qwen3TTSModel.from_pretrained(\n        MODEL_PATH,\n        device_map=device,\n        dtype=torch.bfloat16,\n        attn_implementation=\"flash_attention_2\",\n    )\n\n    # -------- Single (with instruct) --------\n    torch.cuda.synchronize()\n    t0 = time.time()\n\n    wavs, sr = tts.generate_custom_voice(\n        text=\"其实我真的有发现，我是一个特别善于观察别人情绪的人。\",\n        language=\"Chinese\",\n        speaker=\"Vivian\",\n        instruct=\"用特别愤怒的语气说\",\n    )\n\n    torch.cuda.synchronize()\n    t1 = time.time()\n    print(f\"[CustomVoice Single] time: {t1 - t0:.3f}s\")\n\n    sf.write(\"qwen3_tts_test_custom_single.wav\", wavs[0], sr)\n\n    # -------- Batch (some empty instruct) --------\n    texts = [\"其实我真的有发现，我是一个特别善于观察别人情绪的人。\", \"She said she would be here by noon.\"]\n    languages = [\"Chinese\", \"English\"]\n    speakers = [\"Vivian\", \"Ryan\"]\n    instructs = [\"\", \"Very happy.\"]\n\n    torch.cuda.synchronize()\n    t0 = time.time()\n\n    wavs, sr = tts.generate_custom_voice(\n        text=texts,\n        language=languages,\n        speaker=speakers,\n        instruct=instructs,\n        max_new_tokens=2048,\n    )\n\n    torch.cuda.synchronize()\n    t1 = time.time()\n    print(f\"[CustomVoice Batch] time: {t1 - t0:.3f}s\")\n\n    for i, w in enumerate(wavs):\n        sf.write(f\"qwen3_tts_test_custom_batch_{i}.wav\", w, sr)\n\n\nif __name__ == \"__main__\":\n    main()\n"
+        }
+    ]
+}

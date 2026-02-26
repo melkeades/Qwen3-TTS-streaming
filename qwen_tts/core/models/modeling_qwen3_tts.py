@@ -2731,6 +2731,26 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                     ref_code_context = ref_code_list[0].to(self.talker.device)
                     ref_code_frames = ref_code_context.shape[0]
 
+        # For non-ICL paths (e.g. CustomVoice), synthesize a silence-code context once and
+        # reuse it to stabilize initial decode windows. This avoids cold-start artifacts.
+        if ref_code_context is None and decode_window_frames > 0:
+            silence_ctx = getattr(self, "_stream_silence_ref_code_context", None)
+            if silence_ctx is None or silence_ctx.device != self.talker.device:
+                try:
+                    sr = int(getattr(self.speech_tokenizer, "output_sample_rate", 24000))
+                    silence_wav = np.zeros(int(sr * 0.25), dtype=np.float32)
+                    silence_enc = self.speech_tokenizer.encode(silence_wav, sr=sr)
+                    silence_codes = silence_enc.audio_codes[0].to(self.talker.device)
+                    if silence_codes.shape[0] > 0:
+                        repeat = (decode_window_frames + silence_codes.shape[0] - 1) // silence_codes.shape[0]
+                        silence_ctx = silence_codes.repeat((repeat, 1))[:decode_window_frames].contiguous()
+                        self._stream_silence_ref_code_context = silence_ctx
+                except Exception:
+                    silence_ctx = None
+            if silence_ctx is not None:
+                ref_code_context = silence_ctx
+                ref_code_frames = ref_code_context.shape[0]
+
         # Decode loop
         codes_buffer: list[torch.Tensor] = []
         decoded_tail: Optional[np.ndarray] = None
@@ -2796,14 +2816,19 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
                 window_codes, ref_code_context, ref_code_frames, decode_window_frames
             )
 
-            # Use optimized decode path when available
-            # Pass pad_to_size to ensure fixed tensor size for torch.compile
+            # Avoid padded optimized decode until the window is full.
+            # Early left-padding with zero codes can contaminate initial causal frames and
+            # produce startup artifacts on CustomVoice (no ref_code context available).
             if use_optimized_decode and hasattr(self.speech_tokenizer, 'decode_streaming'):
-                wavs, sr = self.speech_tokenizer.decode_streaming(
-                    window.to(self.talker.device),
-                    use_optimized=True,
-                    pad_to_size=decode_window_frames,
-                )
+                can_use_padded_optimized = window.shape[0] >= decode_window_frames
+                if can_use_padded_optimized:
+                    wavs, sr = self.speech_tokenizer.decode_streaming(
+                        window.to(self.talker.device),
+                        use_optimized=True,
+                        pad_to_size=decode_window_frames,
+                    )
+                else:
+                    wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
             else:
                 wavs, sr = self.speech_tokenizer.decode([{"audio_codes": window.to(self.talker.device)}])
             # Debug removed for performance: decode time tracking
