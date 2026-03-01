@@ -7,6 +7,7 @@ from pathlib import Path
 
 @dataclass(frozen=True)
 class CustomBridgeConfig:
+    repo_root: Path
     host: str
     port: int
     cors_allow_origins: list[str]
@@ -48,6 +49,10 @@ class CustomBridgeConfig:
     warmup_speaker: str
     warmup_instruct: str
 
+    model_scan_roots: list[Path]
+    model_scan_max_depth: int
+    additional_model_ids: list[str]
+
     client_html_path: Path
 
     @staticmethod
@@ -64,6 +69,16 @@ class CustomBridgeConfig:
         items = [x.strip() for x in raw.split(",")]
         return [x for x in items if x]
 
+    @staticmethod
+    def _resolve_paths(raw_paths: list[str], repo_root: Path) -> list[Path]:
+        resolved: list[Path] = []
+        for value in raw_paths:
+            p = Path(value)
+            if not p.is_absolute():
+                p = repo_root / p
+            resolved.append(p.resolve())
+        return resolved
+
     @classmethod
     def from_env(cls) -> "CustomBridgeConfig":
         repo_root = Path(__file__).resolve().parent.parent
@@ -74,7 +89,13 @@ class CustomBridgeConfig:
         if not client_html_path.is_absolute():
             client_html_path = repo_root / client_html_path
 
+        model_scan_roots = cls._resolve_paths(
+            cls._env_csv("CUSTOM_BRIDGE_MODEL_SCAN_ROOTS", "output"),
+            repo_root=repo_root,
+        )
+
         return cls(
+            repo_root=repo_root,
             host=os.getenv("CUSTOM_BRIDGE_HOST", "0.0.0.0"),
             port=int(os.getenv("CUSTOM_BRIDGE_PORT", "8040")),
             cors_allow_origins=cls._env_csv("CUSTOM_BRIDGE_CORS_ALLOW_ORIGINS", "*"),
@@ -116,5 +137,8 @@ class CustomBridgeConfig:
             warmup_language=os.getenv("CUSTOM_BRIDGE_WARMUP_LANGUAGE", "English"),
             warmup_speaker=os.getenv("CUSTOM_BRIDGE_WARMUP_SPEAKER", "Ryan"),
             warmup_instruct=os.getenv("CUSTOM_BRIDGE_WARMUP_INSTRUCT", "neutral and clear"),
+            model_scan_roots=model_scan_roots,
+            model_scan_max_depth=int(os.getenv("CUSTOM_BRIDGE_MODEL_SCAN_MAX_DEPTH", "3")),
+            additional_model_ids=cls._env_csv("CUSTOM_BRIDGE_ADDITIONAL_MODEL_IDS", ""),
             client_html_path=client_html_path,
         )

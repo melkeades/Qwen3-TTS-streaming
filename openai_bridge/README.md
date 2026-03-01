@@ -6,6 +6,8 @@ It serves:
 - `POST /v1/audio/speech`
 - `POST /v1/audio/stop`
 - `GET /v1/models`
+- `GET /v1/speakers` (custom bridge)
+- `POST /v1/models/unload` (custom bridge)
 - `GET /healthz`
 - `GET /` (live HTML client)
 
@@ -77,7 +79,7 @@ Request body:
 ```
 
 Notes:
-- OpenAI-compatible core fields: `model`, `input`, `voice`, `response_format`, `speed`.
+- OpenAI-compatible core fields: `model`, `input`, `voice`, `response_format`, `speed`, `instructions`.
 - Optional bridge extensions are accepted: `speaker`, `instruct`, `language`, `emit_every_frames`, `decode_window_frames`, `overlap_samples`, `max_frames`.
 - Response is streamed audio bytes (`audio/pcm` or `audio/wav`).
 - Response headers include:
@@ -87,9 +89,14 @@ Notes:
 
 CustomVoice bridge notes:
 - `voice` is used as speaker id (OpenAI-compatible field).
-- You can optionally send `speaker` (alias for `voice`) and `instruct`.
+- You can send OpenAI-style `instructions`; legacy `instruct` is still accepted.
 - You can optionally send `use_optimized_decode` to override server default per request.
 - `/healthz` now reports `startup_ready` so clients can wait until warmup/compile pass is done.
+- `/v1/models` includes the default model and discovered local checkpoints (for example `output/checkpoint-epoch-2`).
+- Custom bridge reuses already-loaded models from in-memory cache when switching back.
+- Use `POST /v1/models/unload?model=<id>` (or `?all=true`) to free VRAM for cached model(s).
+- `/v1/speakers?model=<id>` returns speaker ids for a selected model (including local `config.json` speaker IDs like `talker_config.spk_id`).
+- The custom bridge loads the requested model via `Qwen3TTSModel.from_pretrained(...)`; switching model while streams are active returns `409`.
 - Example payload for custom bridge:
 
 ```json
@@ -98,7 +105,7 @@ CustomVoice bridge notes:
   "input": "And now I am talking in a very angry tone.",
   "voice": "Ryan",
   "speaker": "Ryan",
-  "instruct": "very angry, livid",
+  "instructions": "very angry, livid",
   "language": "English",
   "response_format": "pcm",
   "speed": 1.0
@@ -181,6 +188,9 @@ Server:
 
 Model:
 - `CUSTOM_BRIDGE_MODEL_ID` (default `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`)
+- `CUSTOM_BRIDGE_MODEL_SCAN_ROOTS` (default `output`, comma-separated roots scanned for local checkpoints)
+- `CUSTOM_BRIDGE_MODEL_SCAN_MAX_DEPTH` (default `3`)
+- `CUSTOM_BRIDGE_ADDITIONAL_MODEL_IDS` (default empty, comma-separated)
 - `CUSTOM_BRIDGE_DEVICE_MAP` (default `cuda:0`)
 - `CUSTOM_BRIDGE_DTYPE` (default `bfloat16`)
 - `CUSTOM_BRIDGE_ATTN_IMPL` (default `flash_attention_2`)

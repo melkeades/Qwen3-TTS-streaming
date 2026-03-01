@@ -113,6 +113,7 @@ def create_app() -> FastAPI:
             yield
         finally:
             app.state.runtime.cancel_all()
+            pipeline.unload_all_models()
 
     app = FastAPI(title="Qwen OpenAI Bridge (CustomVoice)", version="0.1.0", lifespan=lifespan)
     app.add_middleware(
@@ -145,11 +146,17 @@ def create_app() -> FastAPI:
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
         runtime: CustomBridgeRuntime = app.state.runtime
+        models = runtime.pipeline.discover_models(refresh=True)
         speakers = runtime.pipeline.speaker_names()
+        cached_models = runtime.pipeline.cached_model_ids()
         return {
             "ok": bool(runtime.pipeline.startup_ready),
             "startup_ready": runtime.pipeline.startup_ready,
-            "model_id": runtime.config.model_id,
+            "model_id": runtime.pipeline.active_model_id or runtime.config.model_id,
+            "default_model_id": runtime.config.model_id,
+            "available_models": models,
+            "cached_models": cached_models,
+            "cached_count": len(cached_models),
             "default_speaker": runtime.config.default_speaker,
             "default_language": runtime.config.default_language,
             "stream_use_optimized_decode": runtime.config.stream_use_optimized_decode,
@@ -163,15 +170,73 @@ def create_app() -> FastAPI:
     @app.get("/v1/models", response_model=ModelListResponse)
     async def v1_models() -> ModelListResponse:
         runtime: CustomBridgeRuntime = app.state.runtime
+        model_ids = runtime.pipeline.discover_models(refresh=True)
         return ModelListResponse(
             data=[
                 ModelObject(
-                    id=runtime.config.model_id,
+                    id=model_id,
                     created=int(time.time()),
                     owned_by="qwen-local",
                 )
+                for model_id in model_ids
             ]
         )
+
+    @app.post("/v1/models/unload")
+    async def v1_models_unload(model: str | None = None, all: bool = False) -> dict[str, Any]:
+        runtime: CustomBridgeRuntime = app.state.runtime
+        if runtime.active_count() > 0:
+            raise HTTPException(
+                status_code=409,
+                detail="Cannot unload model(s) while streams are active. Stop stream(s) first.",
+            )
+
+        if all:
+            unloaded = runtime.pipeline.unload_all_models()
+            return {
+                "ok": True,
+                "unloaded": unloaded,
+                "active_model_id": runtime.pipeline.active_model_id,
+                "cached_models": runtime.pipeline.cached_model_ids(),
+            }
+
+        requested_model = (model or runtime.pipeline.active_model_id or "").strip()
+        if not requested_model:
+            raise HTTPException(
+                status_code=400,
+                detail="No model specified. Provide ?model=<id> or use ?all=true.",
+            )
+        unloaded = runtime.pipeline.unload_model(requested_model)
+        if not unloaded:
+            raise HTTPException(
+                status_code=404,
+                detail=f"Model '{requested_model}' is not currently loaded in cache.",
+            )
+        return {
+            "ok": True,
+            "model": requested_model,
+            "unloaded": 1,
+            "active_model_id": runtime.pipeline.active_model_id,
+            "cached_models": runtime.pipeline.cached_model_ids(),
+        }
+
+    @app.get("/v1/speakers")
+    async def v1_speakers(model: str | None = None) -> dict[str, Any]:
+        runtime: CustomBridgeRuntime = app.state.runtime
+        requested_model = (
+            (model or runtime.pipeline.active_model_id or runtime.config.model_id).strip()
+        )
+        try:
+            speakers = runtime.pipeline.speaker_names_for_model(requested_model, refresh=True)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "object": "list",
+            "model": requested_model,
+            "speakers": speakers,
+            "count": len(speakers),
+        }
 
     @app.post("/v1/audio/stop", response_model=StopResponse)
     async def v1_audio_stop() -> StopResponse:
@@ -183,14 +248,20 @@ def create_app() -> FastAPI:
     async def v1_audio_speech(req: SpeechSynthesisParams):
         runtime: CustomBridgeRuntime = app.state.runtime
 
-        if req.model != runtime.config.model_id:
+        req_model = req.model.strip()
+        active_model = runtime.pipeline.active_model_id
+        if active_model and req_model != active_model and runtime.active_count() > 0:
             raise HTTPException(
-                status_code=400,
+                status_code=409,
                 detail=(
-                    f"Unsupported model '{req.model}'. "
-                    f"Expected '{runtime.config.model_id}'."
+                    f"Cannot switch model from '{active_model}' to '{req_model}' "
+                    "while streams are active. Stop current stream(s) first."
                 ),
             )
+        try:
+            runtime.pipeline.ensure_model_loaded(req_model)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
 
         speaker = (req.speaker or req.voice or runtime.config.default_speaker).strip()
         if not speaker:
@@ -228,6 +299,7 @@ def create_app() -> FastAPI:
             "X-Audio-Sample-Rate": str(runtime.config.sample_rate),
             "X-Audio-Channels": str(runtime.config.channels),
             "X-Audio-Bits-Per-Sample": str(runtime.config.bits_per_sample),
+            "X-Model-Id": runtime.pipeline.active_model_id or req_model,
             "X-Custom-Speaker": speaker,
             "X-Custom-Language": req.language or runtime.config.default_language,
         }

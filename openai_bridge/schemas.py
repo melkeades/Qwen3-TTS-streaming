@@ -27,6 +27,8 @@ class SpeechSynthesisParams(BaseModel):
 
     # Optional bridge extensions (accepted but not required by OpenAI schema)
     speaker: Optional[str] = None
+    instructions: Optional[str] = None
+    # Backward compatibility for older bridge clients.
     instruct: Optional[str] = None
     language: Optional[str] = None
     emit_every_frames: Optional[int] = Field(default=None, ge=1)

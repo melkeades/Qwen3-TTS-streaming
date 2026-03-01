@@ -136,7 +136,7 @@
 
     .row {
       display: grid;
-      grid-template-columns: repeat(3, minmax(0, 1fr));
+      grid-template-columns: repeat(4, minmax(0, 1fr));
       gap: 10px;
       margin-top: 12px;
     }
@@ -238,11 +238,15 @@
           </div>
           <div>
             <label for="model">Model</label>
-            <input id="model" value="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice" />
+            <select id="model">
+              <option value="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice">Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice</option>
+            </select>
           </div>
           <div>
             <label for="voice">Speaker (OpenAI voice field)</label>
-            <input id="voice" value="Ryan" />
+            <select id="voice">
+              <option value="Ryan">Ryan</option>
+            </select>
           </div>
           <div>
             <label for="responseFormat">Response Format</label>
@@ -292,6 +296,7 @@
         <div class="row">
           <button id="runBtn" type="submit">Run Custom Stream</button>
           <button id="warmupBtn" class="secondary" type="button">Custom Warmup</button>
+          <button id="unloadBtn" class="secondary" type="button">Unload Model</button>
           <button id="stopBtn" class="warn" type="button" disabled>Stop</button>
         </div>
       </form>
@@ -325,6 +330,8 @@
     const DEFAULT_SAMPLE_RATE = 24000;
     const DEFAULT_CHANNELS = 1;
     const DEFAULT_BITS = 16;
+    const FALLBACK_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
+    const FALLBACK_SPEAKER_ID = "Ryan";
 
     const el = {
       form: document.getElementById("ttsForm"),
@@ -341,6 +348,7 @@
       prompt: document.getElementById("prompt"),
       runBtn: document.getElementById("runBtn"),
       warmupBtn: document.getElementById("warmupBtn"),
+      unloadBtn: document.getElementById("unloadBtn"),
       stopBtn: document.getElementById("stopBtn"),
       status: document.getElementById("status"),
       log: document.getElementById("log"),
@@ -406,6 +414,117 @@
 
     function clearLog() {
       el.log.textContent = "";
+    }
+
+    function setModelOptions(modelIds, selectedModelId) {
+      const ids = (Array.isArray(modelIds) ? modelIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean);
+
+      if (ids.length === 0) {
+        ids.push(FALLBACK_MODEL_ID);
+      }
+
+      const deduped = [...new Set(ids)];
+      const selected = deduped.includes(selectedModelId) ? selectedModelId : deduped[0];
+
+      el.model.innerHTML = "";
+      for (const id of deduped) {
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = id;
+        el.model.appendChild(opt);
+      }
+      el.model.value = selected;
+    }
+
+    async function refreshModelDropdown(quiet = false) {
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      if (!baseUrl) {
+        setModelOptions([FALLBACK_MODEL_ID], el.model.value);
+        setSpeakerOptions([FALLBACK_SPEAKER_ID], el.voice.value);
+        return;
+      }
+
+      const previous = (el.model.value || "").trim() || FALLBACK_MODEL_ID;
+      try {
+        const resp = await fetch(`${baseUrl}/v1/models`, { method: "GET" });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
+        }
+
+        const payload = await resp.json();
+        const ids = Array.isArray(payload?.data)
+          ? payload.data.map((item) => item?.id)
+          : [];
+
+        setModelOptions(ids, previous);
+        await refreshSpeakerDropdown(quiet);
+        if (!quiet) {
+          appendLog(`models loaded (${el.model.options.length})`);
+        }
+      } catch (error) {
+        setModelOptions([previous || FALLBACK_MODEL_ID], previous);
+        await refreshSpeakerDropdown(true);
+        if (!quiet) {
+          appendLog(`model refresh failed: ${error.message}`);
+        }
+      }
+    }
+
+    function setSpeakerOptions(speakerIds, selectedSpeakerId) {
+      const ids = (Array.isArray(speakerIds) ? speakerIds : [])
+        .map((id) => String(id || "").trim())
+        .filter(Boolean);
+
+      if (ids.length === 0) {
+        ids.push(FALLBACK_SPEAKER_ID);
+      }
+
+      const deduped = [...new Set(ids)];
+      const selected = deduped.includes(selectedSpeakerId) ? selectedSpeakerId : deduped[0];
+
+      el.voice.innerHTML = "";
+      for (const id of deduped) {
+        const opt = document.createElement("option");
+        opt.value = id;
+        opt.textContent = id;
+        el.voice.appendChild(opt);
+      }
+      el.voice.value = selected;
+    }
+
+    async function refreshSpeakerDropdown(quiet = false) {
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      const model = el.model.value.trim() || FALLBACK_MODEL_ID;
+      const previous = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
+
+      if (!baseUrl) {
+        setSpeakerOptions([previous], previous);
+        return;
+      }
+
+      try {
+        const url = `${baseUrl}/v1/speakers?model=${encodeURIComponent(model)}`;
+        const resp = await fetch(url, { method: "GET" });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
+        }
+
+        const payload = await resp.json();
+        const ids = Array.isArray(payload?.speakers) ? payload.speakers : [];
+        setSpeakerOptions(ids, previous);
+        if (!quiet) {
+          appendLog(`speakers loaded for ${model} (${el.voice.options.length})`);
+        }
+      } catch (error) {
+        setSpeakerOptions([previous || FALLBACK_SPEAKER_ID], previous);
+        if (!quiet) {
+          appendLog(`speaker refresh failed: ${error.message}`);
+        }
+      }
     }
 
     function newStats() {
@@ -710,14 +829,14 @@
 
     async function streamOneSegment(segmentText, segmentIndex, segmentCount) {
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
-      const speaker = el.voice.value.trim() || "Ryan";
+      const speaker = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
       const payload = {
         model: el.model.value.trim(),
         input: segmentText,
         voice: speaker,
         speaker,
         language: el.language.value.trim() || "English",
-        instruct: el.instruct.value.trim(),
+        instructions: el.instruct.value.trim(),
         response_format: el.responseFormat.value,
         speed: Number.parseFloat(el.speed.value || "1") || 1.0
       };
@@ -799,22 +918,24 @@
       if (state.running) {
         return;
       }
+      await refreshModelDropdown(true);
 
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
-      const speaker = el.voice.value.trim() || "Ryan";
+      const speaker = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
       const payload = {
         model: el.model.value.trim(),
         input: "hi",
         voice: speaker,
         speaker,
         language: el.language.value.trim() || "English",
-        instruct: el.instruct.value.trim(),
+        instructions: el.instruct.value.trim(),
         response_format: "pcm",
         speed: 1.0
       };
 
       setStatus("Running warmup...");
       el.warmupBtn.disabled = true;
+      el.unloadBtn.disabled = true;
 
       try {
         const t0 = nowMs();
@@ -848,6 +969,7 @@
         appendLog(`warmup failed: ${error.message}`);
       } finally {
         el.warmupBtn.disabled = false;
+        el.unloadBtn.disabled = false;
       }
     }
 
@@ -855,6 +977,7 @@
       if (state.running) {
         return;
       }
+      await refreshModelDropdown(true);
 
       const prompt = (el.prompt.value || "").trim();
       if (!prompt) {
@@ -874,6 +997,7 @@
 
       el.runBtn.disabled = true;
       el.warmupBtn.disabled = true;
+      el.unloadBtn.disabled = true;
       el.stopBtn.disabled = false;
 
       try {
@@ -915,6 +1039,7 @@
         state.stopRequested = false;
         el.runBtn.disabled = false;
         el.warmupBtn.disabled = false;
+        el.unloadBtn.disabled = false;
         el.stopBtn.disabled = true;
       }
     }
@@ -939,6 +1064,38 @@
       }
     }
 
+    async function unloadSelectedModel() {
+      if (state.running) {
+        return;
+      }
+
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      const model = (el.model.value || "").trim();
+      if (!baseUrl || !model) {
+        return;
+      }
+
+      el.unloadBtn.disabled = true;
+      setStatus(`Unloading model ${model}...`);
+      try {
+        const url = `${baseUrl}/v1/models/unload?model=${encodeURIComponent(model)}`;
+        const resp = await fetch(url, { method: "POST" });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
+        }
+        await refreshModelDropdown(true);
+        await refreshSpeakerDropdown(true);
+        appendLog(`model unloaded: ${model}`);
+        setStatus(`Model unloaded: ${model}`, "accent");
+      } catch (error) {
+        appendLog(`unload failed: ${error.message}`);
+        setStatus(`Unload failed: ${error.message}`, "error");
+      } finally {
+        el.unloadBtn.disabled = false;
+      }
+    }
+
     el.form.addEventListener("submit", (event) => {
       event.preventDefault();
       runStreaming();
@@ -948,8 +1105,24 @@
       runWarmup();
     });
 
+    el.unloadBtn.addEventListener("click", () => {
+      unloadSelectedModel();
+    });
+
     el.stopBtn.addEventListener("click", () => {
       stopStreaming();
+    });
+
+    el.baseUrl.addEventListener("change", () => {
+      refreshModelDropdown();
+    });
+
+    el.baseUrl.addEventListener("blur", () => {
+      refreshModelDropdown(true);
+    });
+
+    el.model.addEventListener("change", () => {
+      refreshSpeakerDropdown();
     });
 
     window.addEventListener("beforeunload", () => {
@@ -961,6 +1134,7 @@
 
     state.stats = newStats();
     updateStats();
+    refreshModelDropdown(true);
   </script>
 </body>
 </html>
