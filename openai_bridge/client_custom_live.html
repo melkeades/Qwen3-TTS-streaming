@@ -136,12 +136,20 @@
 
     .row {
       display: grid;
-      grid-template-columns: repeat(4, minmax(0, 1fr));
+      grid-template-columns: repeat(6, minmax(0, 1fr));
       gap: 10px;
       margin-top: 12px;
     }
 
+    @media (max-width: 1080px) {
+      .row { grid-template-columns: repeat(3, minmax(0, 1fr)); }
+    }
+
     @media (max-width: 760px) {
+      .row { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+    }
+
+    @media (max-width: 520px) {
       .row { grid-template-columns: 1fr; }
     }
 
@@ -239,7 +247,7 @@
           <div>
             <label for="model">Model</label>
             <select id="model">
-              <option value="Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice">Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice</option>
+              <option value="">None (select model)</option>
             </select>
           </div>
           <div>
@@ -296,7 +304,9 @@
         <div class="row">
           <button id="runBtn" type="submit">Run Custom Stream</button>
           <button id="warmupBtn" class="secondary" type="button">Custom Warmup</button>
+          <button id="refreshBtn" class="secondary" type="button">Refresh Models</button>
           <button id="unloadBtn" class="secondary" type="button">Unload Model</button>
+          <button id="unloadAllBtn" class="secondary" type="button">Unload All</button>
           <button id="stopBtn" class="warn" type="button" disabled>Stop</button>
         </div>
       </form>
@@ -331,6 +341,7 @@
     const DEFAULT_CHANNELS = 1;
     const DEFAULT_BITS = 16;
     const FALLBACK_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
+    const EMPTY_MODEL_VALUE = "";
     const FALLBACK_SPEAKER_ID = "Ryan";
 
     const el = {
@@ -348,7 +359,9 @@
       prompt: document.getElementById("prompt"),
       runBtn: document.getElementById("runBtn"),
       warmupBtn: document.getElementById("warmupBtn"),
+      refreshBtn: document.getElementById("refreshBtn"),
       unloadBtn: document.getElementById("unloadBtn"),
+      unloadAllBtn: document.getElementById("unloadAllBtn"),
       stopBtn: document.getElementById("stopBtn"),
       status: document.getElementById("status"),
       log: document.getElementById("log"),
@@ -416,19 +429,34 @@
       el.log.textContent = "";
     }
 
+    function setIdleActionState(disabled) {
+      el.runBtn.disabled = disabled;
+      el.warmupBtn.disabled = disabled;
+      el.refreshBtn.disabled = disabled;
+      el.unloadBtn.disabled = disabled;
+      el.unloadAllBtn.disabled = disabled;
+      el.model.disabled = disabled;
+    }
+
     function setModelOptions(modelIds, selectedModelId) {
       const ids = (Array.isArray(modelIds) ? modelIds : [])
         .map((id) => String(id || "").trim())
         .filter(Boolean);
 
-      if (ids.length === 0) {
+      if (ids.length === 0 && selectedModelId) {
         ids.push(FALLBACK_MODEL_ID);
       }
 
       const deduped = [...new Set(ids)];
-      const selected = deduped.includes(selectedModelId) ? selectedModelId : deduped[0];
+      const selected = (selectedModelId && deduped.includes(selectedModelId))
+        ? selectedModelId
+        : EMPTY_MODEL_VALUE;
 
       el.model.innerHTML = "";
+      const noneOpt = document.createElement("option");
+      noneOpt.value = EMPTY_MODEL_VALUE;
+      noneOpt.textContent = "None (select model)";
+      el.model.appendChild(noneOpt);
       for (const id of deduped) {
         const opt = document.createElement("option");
         opt.value = id;
@@ -441,12 +469,12 @@
     async function refreshModelDropdown(quiet = false) {
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
       if (!baseUrl) {
-        setModelOptions([FALLBACK_MODEL_ID], el.model.value);
+        setModelOptions([FALLBACK_MODEL_ID], el.model.value || EMPTY_MODEL_VALUE);
         setSpeakerOptions([FALLBACK_SPEAKER_ID], el.voice.value);
-        return;
+        return false;
       }
 
-      const previous = (el.model.value || "").trim() || FALLBACK_MODEL_ID;
+      const previous = (el.model.value || "").trim();
       try {
         const resp = await fetch(`${baseUrl}/v1/models`, { method: "GET" });
         if (!resp.ok) {
@@ -464,12 +492,14 @@
         if (!quiet) {
           appendLog(`models loaded (${el.model.options.length})`);
         }
+        return true;
       } catch (error) {
         setModelOptions([previous || FALLBACK_MODEL_ID], previous);
         await refreshSpeakerDropdown(true);
         if (!quiet) {
           appendLog(`model refresh failed: ${error.message}`);
         }
+        return false;
       }
     }
 
@@ -497,10 +527,15 @@
 
     async function refreshSpeakerDropdown(quiet = false) {
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
-      const model = el.model.value.trim() || FALLBACK_MODEL_ID;
+      const model = el.model.value.trim();
       const previous = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
 
       if (!baseUrl) {
+        setSpeakerOptions([previous], previous);
+        return;
+      }
+
+      if (!model) {
         setSpeakerOptions([previous], previous);
         return;
       }
@@ -731,6 +766,37 @@
       }
     }
 
+    function queuedAudioSeconds() {
+      if (!state.audioCtx) {
+        return 0;
+      }
+      return Math.max(0, state.scheduledUntilSec - state.audioCtx.currentTime);
+    }
+
+    async function waitForPlaybackDrain() {
+      let hadQueuedAudio = false;
+      while (queuedAudioSeconds() > 0.01 && state.audioCtx) {
+        hadQueuedAudio = true;
+        updateDerivedStats();
+        updateStats();
+        await new Promise((resolve) => setTimeout(resolve, 25));
+      }
+      return hadQueuedAudio;
+    }
+
+    function selectedModelId() {
+      return (el.model.value || "").trim();
+    }
+
+    function ensureModelSelected() {
+      const model = selectedModelId();
+      if (!model) {
+        setStatus("Select a model first.", "error");
+        return null;
+      }
+      return model;
+    }
+
     function queueFloat32(float32, sampleRate) {
       if (!(float32 instanceof Float32Array) || float32.length === 0) {
         return;
@@ -831,7 +897,7 @@
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
       const speaker = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
       const payload = {
-        model: el.model.value.trim(),
+        model: selectedModelId(),
         input: segmentText,
         voice: speaker,
         speaker,
@@ -919,11 +985,15 @@
         return;
       }
       await refreshModelDropdown(true);
+      const model = ensureModelSelected();
+      if (!model) {
+        return;
+      }
 
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
       const speaker = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
       const payload = {
-        model: el.model.value.trim(),
+        model,
         input: "hi",
         voice: speaker,
         speaker,
@@ -936,6 +1006,8 @@
       setStatus("Running warmup...");
       el.warmupBtn.disabled = true;
       el.unloadBtn.disabled = true;
+      el.unloadAllBtn.disabled = true;
+      el.refreshBtn.disabled = true;
 
       try {
         const t0 = nowMs();
@@ -970,6 +1042,8 @@
       } finally {
         el.warmupBtn.disabled = false;
         el.unloadBtn.disabled = false;
+        el.unloadAllBtn.disabled = false;
+        el.refreshBtn.disabled = false;
       }
     }
 
@@ -978,6 +1052,10 @@
         return;
       }
       await refreshModelDropdown(true);
+      const model = ensureModelSelected();
+      if (!model) {
+        return;
+      }
 
       const prompt = (el.prompt.value || "").trim();
       if (!prompt) {
@@ -995,10 +1073,9 @@
       clearLog();
       updateStats();
 
-      el.runBtn.disabled = true;
-      el.warmupBtn.disabled = true;
-      el.unloadBtn.disabled = true;
+      setIdleActionState(true);
       el.stopBtn.disabled = false;
+      let completed = false;
 
       try {
         await ensureAudioContext();
@@ -1021,9 +1098,10 @@
           await streamOneSegment(segments[i], i, segments.length);
         }
 
+        completed = true;
         updateDerivedStats();
         updateStats();
-        setStatus("Stream complete.", "accent");
+        setStatus("Stream complete. Finishing playback...", "accent");
       } catch (error) {
         const aborted = (error && error.name === "AbortError") || state.stopRequested;
         if (aborted) {
@@ -1034,27 +1112,28 @@
           appendLog(`stream failed: ${error.message}`);
         }
       } finally {
-        state.running = false;
         state.abortController = null;
+        const hadQueuedAudio = await waitForPlaybackDrain();
+        if (completed && hadQueuedAudio && !state.stopRequested) {
+          setStatus("Playback complete.", "accent");
+        }
+        state.running = false;
         state.stopRequested = false;
-        el.runBtn.disabled = false;
-        el.warmupBtn.disabled = false;
-        el.unloadBtn.disabled = false;
+        setIdleActionState(false);
         el.stopBtn.disabled = true;
       }
     }
 
     async function stopStreaming() {
       state.stopRequested = true;
+      setStatus("Stopping stream...", "warn-text");
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
-      let stopSent = false;
       try {
         await fetch(`${baseUrl}/v1/audio/stop`, { method: "POST" });
-        stopSent = true;
       } catch (_) {
         // Ignore stop endpoint failures; local abort still proceeds.
       }
-      if (!stopSent && state.abortController) {
+      if (state.abortController) {
         state.abortController.abort();
       }
       await hardStopAudio();
@@ -1076,6 +1155,8 @@
       }
 
       el.unloadBtn.disabled = true;
+      el.unloadAllBtn.disabled = true;
+      el.refreshBtn.disabled = true;
       setStatus(`Unloading model ${model}...`);
       try {
         const url = `${baseUrl}/v1/models/unload?model=${encodeURIComponent(model)}`;
@@ -1093,6 +1174,99 @@
         setStatus(`Unload failed: ${error.message}`, "error");
       } finally {
         el.unloadBtn.disabled = false;
+        el.unloadAllBtn.disabled = false;
+        el.refreshBtn.disabled = false;
+      }
+    }
+
+    async function unloadAllModels() {
+      if (state.running) {
+        return;
+      }
+
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      if (!baseUrl) {
+        return;
+      }
+
+      el.unloadBtn.disabled = true;
+      el.unloadAllBtn.disabled = true;
+      el.refreshBtn.disabled = true;
+      setStatus("Unloading all cached models...");
+      try {
+        const resp = await fetch(`${baseUrl}/v1/models/unload?all=true`, { method: "POST" });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
+        }
+        const payload = await resp.json();
+        const unloaded = Number(payload?.unloaded || 0);
+        await refreshModelDropdown(true);
+        await refreshSpeakerDropdown(true);
+        appendLog(`unloaded all models (${unloaded})`);
+        setStatus(`Unloaded ${unloaded} model(s).`, "accent");
+      } catch (error) {
+        appendLog(`unload-all failed: ${error.message}`);
+        setStatus(`Unload-all failed: ${error.message}`, "error");
+      } finally {
+        el.unloadBtn.disabled = false;
+        el.unloadAllBtn.disabled = false;
+        el.refreshBtn.disabled = false;
+      }
+    }
+
+    async function refreshModels() {
+      if (state.running) {
+        return;
+      }
+      el.refreshBtn.disabled = true;
+      setStatus("Refreshing model list...");
+      try {
+        const ok = await refreshModelDropdown(false);
+        if (ok) {
+          appendLog(`models refreshed (${el.model.options.length})`);
+          setStatus(`Models refreshed (${el.model.options.length}).`, "accent");
+        } else {
+          setStatus("Model refresh failed. Check logs.", "error");
+        }
+      } finally {
+        el.refreshBtn.disabled = false;
+      }
+    }
+
+    async function selectModel(modelId, quiet = false) {
+      if (state.running) {
+        return;
+      }
+
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      const model = (modelId || "").trim();
+      if (!baseUrl || !model) {
+        return;
+      }
+
+      setIdleActionState(true);
+      setStatus(`Loading model ${model}...`);
+
+      try {
+        const url = `${baseUrl}/v1/models/select?model=${encodeURIComponent(model)}`;
+        const resp = await fetch(url, { method: "POST" });
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
+        }
+        const payload = await resp.json();
+        await refreshSpeakerDropdown(true);
+        if (!quiet) {
+          appendLog(`model activated: ${payload?.model || model}`);
+        }
+        setStatus(`Model ready: ${payload?.model || model}`, "accent");
+      } catch (error) {
+        appendLog(`model switch failed: ${error.message}`);
+        setStatus(`Model switch failed: ${error.message}`, "error");
+        await refreshSpeakerDropdown(true);
+      } finally {
+        setIdleActionState(false);
       }
     }
 
@@ -1105,8 +1279,16 @@
       runWarmup();
     });
 
+    el.refreshBtn.addEventListener("click", () => {
+      refreshModels();
+    });
+
     el.unloadBtn.addEventListener("click", () => {
       unloadSelectedModel();
+    });
+
+    el.unloadAllBtn.addEventListener("click", () => {
+      unloadAllModels();
     });
 
     el.stopBtn.addEventListener("click", () => {
@@ -1122,7 +1304,7 @@
     });
 
     el.model.addEventListener("change", () => {
-      refreshSpeakerDropdown();
+      selectModel(el.model.value);
     });
 
     window.addEventListener("beforeunload", () => {

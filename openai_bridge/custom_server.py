@@ -88,15 +88,18 @@ def create_app() -> FastAPI:
     @asynccontextmanager
     async def lifespan(app: FastAPI):
         pipeline = QwenCustomStreamingPipeline(config=config)
+        should_preload = (not config.startup_empty) and bool((config.model_id or "").strip())
         logger.info(
-            "Custom bridge startup begin model=%s compile=%s optimized_decode=%s warmup=%s runs=%s",
+            "Custom bridge startup begin model=%s preload=%s compile=%s optimized_decode=%s warmup=%s runs=%s",
             config.model_id,
+            should_preload,
             config.optimize_use_compile,
             config.stream_use_optimized_decode,
             config.warmup_enabled,
             config.warmup_runs,
         )
-        pipeline.load()
+        if should_preload:
+            pipeline.load()
 
         app.state.runtime = CustomBridgeRuntime(
             config=config,
@@ -105,7 +108,8 @@ def create_app() -> FastAPI:
             _lock=Lock(),
         )
         logger.info(
-            "Custom bridge ready model=%s speaker_count=%s",
+            "Custom bridge ready active_model=%s default_model=%s speaker_count=%s",
+            pipeline.active_model_id,
             config.model_id,
             len(pipeline.speaker_names()),
         )
@@ -150,10 +154,11 @@ def create_app() -> FastAPI:
         speakers = runtime.pipeline.speaker_names()
         cached_models = runtime.pipeline.cached_model_ids()
         return {
-            "ok": bool(runtime.pipeline.startup_ready),
+            "ok": bool(runtime.pipeline.startup_ready or runtime.config.startup_empty),
             "startup_ready": runtime.pipeline.startup_ready,
-            "model_id": runtime.pipeline.active_model_id or runtime.config.model_id,
-            "default_model_id": runtime.config.model_id,
+            "startup_empty": runtime.config.startup_empty,
+            "model_id": runtime.pipeline.active_model_id,
+            "default_model_id": runtime.config.model_id or None,
             "available_models": models,
             "cached_models": cached_models,
             "cached_count": len(cached_models),
@@ -218,6 +223,35 @@ def create_app() -> FastAPI:
             "unloaded": 1,
             "active_model_id": runtime.pipeline.active_model_id,
             "cached_models": runtime.pipeline.cached_model_ids(),
+        }
+
+    @app.post("/v1/models/select")
+    async def v1_models_select(model: str | None = None) -> dict[str, Any]:
+        runtime: CustomBridgeRuntime = app.state.runtime
+        requested_model = (model or "").strip()
+        if not requested_model:
+            raise HTTPException(status_code=400, detail="Missing model id (?model=<id>).")
+
+        active_model = runtime.pipeline.active_model_id
+        if active_model and requested_model != active_model and runtime.active_count() > 0:
+            raise HTTPException(
+                status_code=409,
+                detail=(
+                    f"Cannot switch model from '{active_model}' to '{requested_model}' "
+                    "while streams are active. Stop current stream(s) first."
+                ),
+            )
+
+        try:
+            runtime.pipeline.ensure_model_loaded(requested_model)
+        except ValueError as exc:
+            raise HTTPException(status_code=400, detail=str(exc)) from exc
+
+        return {
+            "ok": True,
+            "model": runtime.pipeline.active_model_id or requested_model,
+            "cached_models": runtime.pipeline.cached_model_ids(),
+            "speaker_count": len(runtime.pipeline.speaker_names()),
         }
 
     @app.get("/v1/speakers")

@@ -34,6 +34,12 @@ Run the CustomVoice bridge (separate server for `Qwen3-TTS-12Hz-1.7B-CustomVoice
 .venv-bench/bin/python -m openai_bridge.run_custom_bridge
 ```
 
+Start CustomVoice with no preloaded model (`Model=None` until selected):
+
+```bash
+.venv-bench/bin/python -m openai_bridge.run_custom_bridge --empty
+```
+
 Open the client:
 
 - `http://localhost:8030/`
@@ -188,6 +194,7 @@ Server:
 
 Model:
 - `CUSTOM_BRIDGE_MODEL_ID` (default `Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice`)
+- `CUSTOM_BRIDGE_START_EMPTY` (default `false`, skip startup preload and start with no active model)
 - `CUSTOM_BRIDGE_MODEL_SCAN_ROOTS` (default `output`, comma-separated roots scanned for local checkpoints)
 - `CUSTOM_BRIDGE_MODEL_SCAN_MAX_DEPTH` (default `3`)
 - `CUSTOM_BRIDGE_ADDITIONAL_MODEL_IDS` (default empty, comma-separated)

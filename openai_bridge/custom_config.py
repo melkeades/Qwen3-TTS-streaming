@@ -52,6 +52,7 @@ class CustomBridgeConfig:
     model_scan_roots: list[Path]
     model_scan_max_depth: int
     additional_model_ids: list[str]
+    startup_empty: bool
 
     client_html_path: Path
 
@@ -140,5 +141,6 @@ class CustomBridgeConfig:
             model_scan_roots=model_scan_roots,
             model_scan_max_depth=int(os.getenv("CUSTOM_BRIDGE_MODEL_SCAN_MAX_DEPTH", "3")),
             additional_model_ids=cls._env_csv("CUSTOM_BRIDGE_ADDITIONAL_MODEL_IDS", ""),
+            startup_empty=cls._env_bool("CUSTOM_BRIDGE_START_EMPTY", False),
             client_html_path=client_html_path,
         )

@@ -16,7 +16,10 @@ From repo root:
 ```bash
 python -m openai_bridge.run_bridge
 python -m openai_bridge.run_custom_bridge
+python -m openai_bridge.run_custom_bridge --empty
 ```
+
+`--empty` starts the custom bridge without preloading a model, so the client starts with `Model=None` until you pick one.
 
 Default ports:
 
