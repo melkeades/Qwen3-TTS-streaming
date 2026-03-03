@@ -1,0 +1,1 @@
+.\.venv\Scripts\python -m openai_bridge.run_custom_bridge 
