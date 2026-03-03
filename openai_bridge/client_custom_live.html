@@ -242,7 +242,7 @@
         <div class="grid">
           <div>
             <label for="baseUrl">Base URL</label>
-            <input id="baseUrl" value="http://localhost:8040" />
+            <input id="baseUrl" value="http://127.0.0.1:8040" />
           </div>
           <div>
             <label for="model">Model</label>
@@ -253,7 +253,7 @@
           <div>
             <label for="voice">Speaker (OpenAI voice field)</label>
             <select id="voice">
-              <option value="Ryan">Ryan</option>
+              <option value="">None (server default)</option>
             </select>
           </div>
           <div>
@@ -340,9 +340,8 @@
     const DEFAULT_SAMPLE_RATE = 24000;
     const DEFAULT_CHANNELS = 1;
     const DEFAULT_BITS = 16;
-    const FALLBACK_MODEL_ID = "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice";
     const EMPTY_MODEL_VALUE = "";
-    const FALLBACK_SPEAKER_ID = "Ryan";
+    const EMPTY_SPEAKER_VALUE = "";
 
     const el = {
       form: document.getElementById("ttsForm"),
@@ -443,10 +442,6 @@
         .map((id) => String(id || "").trim())
         .filter(Boolean);
 
-      if (ids.length === 0 && selectedModelId) {
-        ids.push(FALLBACK_MODEL_ID);
-      }
-
       const deduped = [...new Set(ids)];
       const selected = (selectedModelId && deduped.includes(selectedModelId))
         ? selectedModelId
@@ -466,17 +461,35 @@
       el.model.value = selected;
     }
 
+    async function fetchServerDefaults(baseUrl) {
+      const resp = await fetch(`${baseUrl}/healthz`, { method: "GET" });
+      if (!resp.ok) {
+        const detail = await resp.text();
+        throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
+      }
+      const payload = await resp.json();
+      return {
+        modelId: String(payload?.model_id || "").trim(),
+        defaultModelId: String(payload?.default_model_id || "").trim(),
+        defaultSpeaker: String(payload?.default_speaker || "").trim(),
+        defaultLanguage: String(payload?.default_language || "").trim(),
+      };
+    }
+
     async function refreshModelDropdown(quiet = false) {
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
       if (!baseUrl) {
-        setModelOptions([FALLBACK_MODEL_ID], el.model.value || EMPTY_MODEL_VALUE);
-        setSpeakerOptions([FALLBACK_SPEAKER_ID], el.voice.value);
+        setModelOptions([], EMPTY_MODEL_VALUE);
+        setSpeakerOptions([], EMPTY_SPEAKER_VALUE);
         return false;
       }
 
       const previous = (el.model.value || "").trim();
       try {
-        const resp = await fetch(`${baseUrl}/v1/models`, { method: "GET" });
+        const [resp, defaults] = await Promise.all([
+          fetch(`${baseUrl}/v1/models`, { method: "GET" }),
+          fetchServerDefaults(baseUrl).catch(() => null),
+        ]);
         if (!resp.ok) {
           const detail = await resp.text();
           throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
@@ -487,14 +500,22 @@
           ? payload.data.map((item) => item?.id)
           : [];
 
-        setModelOptions(ids, previous);
-        await refreshSpeakerDropdown(quiet);
+        const preferredModel =
+          previous ||
+          String(defaults?.modelId || "") ||
+          String(defaults?.defaultModelId || "") ||
+          EMPTY_MODEL_VALUE;
+        setModelOptions(ids, preferredModel);
+        if (!el.language.value.trim() && defaults?.defaultLanguage) {
+          el.language.value = defaults.defaultLanguage;
+        }
+        await refreshSpeakerDropdown(quiet, String(defaults?.defaultSpeaker || ""));
         if (!quiet) {
           appendLog(`models loaded (${el.model.options.length})`);
         }
         return true;
       } catch (error) {
-        setModelOptions([previous || FALLBACK_MODEL_ID], previous);
+        setModelOptions(previous ? [previous] : [], previous);
         await refreshSpeakerDropdown(true);
         if (!quiet) {
           appendLog(`model refresh failed: ${error.message}`);
@@ -508,14 +529,14 @@
         .map((id) => String(id || "").trim())
         .filter(Boolean);
 
-      if (ids.length === 0) {
-        ids.push(FALLBACK_SPEAKER_ID);
-      }
-
       const deduped = [...new Set(ids)];
-      const selected = deduped.includes(selectedSpeakerId) ? selectedSpeakerId : deduped[0];
+      const selected = deduped.includes(selectedSpeakerId) ? selectedSpeakerId : EMPTY_SPEAKER_VALUE;
 
       el.voice.innerHTML = "";
+      const noneOpt = document.createElement("option");
+      noneOpt.value = EMPTY_SPEAKER_VALUE;
+      noneOpt.textContent = "None (server default)";
+      el.voice.appendChild(noneOpt);
       for (const id of deduped) {
         const opt = document.createElement("option");
         opt.value = id;
@@ -525,18 +546,18 @@
       el.voice.value = selected;
     }
 
-    async function refreshSpeakerDropdown(quiet = false) {
+    async function refreshSpeakerDropdown(quiet = false, preferredSpeakerId = "") {
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
       const model = el.model.value.trim();
-      const previous = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
+      const previous = (preferredSpeakerId || el.voice.value || "").trim();
 
       if (!baseUrl) {
-        setSpeakerOptions([previous], previous);
+        setSpeakerOptions([], previous);
         return;
       }
 
       if (!model) {
-        setSpeakerOptions([previous], previous);
+        setSpeakerOptions([], previous);
         return;
       }
 
@@ -555,7 +576,7 @@
           appendLog(`speakers loaded for ${model} (${el.voice.options.length})`);
         }
       } catch (error) {
-        setSpeakerOptions([previous || FALLBACK_SPEAKER_ID], previous);
+        setSpeakerOptions([], previous);
         if (!quiet) {
           appendLog(`speaker refresh failed: ${error.message}`);
         }
@@ -895,17 +916,19 @@
 
     async function streamOneSegment(segmentText, segmentIndex, segmentCount) {
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
-      const speaker = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
+      const speaker = (el.voice.value || "").trim();
       const payload = {
         model: selectedModelId(),
         input: segmentText,
-        voice: speaker,
-        speaker,
         language: el.language.value.trim() || "English",
         instructions: el.instruct.value.trim(),
         response_format: el.responseFormat.value,
         speed: Number.parseFloat(el.speed.value || "1") || 1.0
       };
+      if (speaker) {
+        payload.voice = speaker;
+        payload.speaker = speaker;
+      }
 
       const response = await fetch(`${baseUrl}/v1/audio/speech`, {
         method: "POST",
@@ -944,7 +967,7 @@
       const reader = response.body.getReader();
 
       appendLog(
-        `segment ${segmentIndex + 1}/${segmentCount} started (${segmentText.length} chars), speaker=${speaker}, language=${payload.language}`
+        `segment ${segmentIndex + 1}/${segmentCount} started (${segmentText.length} chars), speaker=${speaker || "(server default)"}, language=${payload.language}`
       );
       setStatus(`Streaming segment ${segmentIndex + 1}/${segmentCount}...`);
 
@@ -991,17 +1014,19 @@
       }
 
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
-      const speaker = (el.voice.value || "").trim() || FALLBACK_SPEAKER_ID;
+      const speaker = (el.voice.value || "").trim();
       const payload = {
         model,
         input: "hi",
-        voice: speaker,
-        speaker,
         language: el.language.value.trim() || "English",
         instructions: el.instruct.value.trim(),
         response_format: "pcm",
         speed: 1.0
       };
+      if (speaker) {
+        payload.voice = speaker;
+        payload.speaker = speaker;
+      }
 
       setStatus("Running warmup...");
       el.warmupBtn.disabled = true;
@@ -1304,7 +1329,12 @@
     });
 
     el.model.addEventListener("change", () => {
-      selectModel(el.model.value);
+      const model = (el.model.value || "").trim();
+      if (!model) {
+        refreshSpeakerDropdown(true);
+        return;
+      }
+      selectModel(model);
     });
 
     window.addEventListener("beforeunload", () => {

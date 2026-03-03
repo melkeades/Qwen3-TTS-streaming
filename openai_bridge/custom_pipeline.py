@@ -126,6 +126,7 @@ class QwenCustomStreamingPipeline:
                 model_map[key] = model_ref
 
         add_model(self.config.model_id, self.config.model_id)
+        add_model(self.config.fallback_model_id, self.config.fallback_model_id)
         for extra in self.config.additional_model_ids:
             add_model(extra, extra)
 

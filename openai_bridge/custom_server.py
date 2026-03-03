@@ -5,7 +5,7 @@ import logging
 import time
 import uuid
 from contextlib import asynccontextmanager
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from threading import Event, Lock
 from typing import Any
 
@@ -87,22 +87,54 @@ def create_app() -> FastAPI:
 
     @asynccontextmanager
     async def lifespan(app: FastAPI):
-        pipeline = QwenCustomStreamingPipeline(config=config)
-        should_preload = (not config.startup_empty) and bool((config.model_id or "").strip())
+        active_config = config
+        pipeline = QwenCustomStreamingPipeline(config=active_config)
+        should_preload = (not active_config.startup_empty) and bool((active_config.model_id or "").strip())
         logger.info(
             "Custom bridge startup begin model=%s preload=%s compile=%s optimized_decode=%s warmup=%s runs=%s",
-            config.model_id,
+            active_config.model_id,
             should_preload,
-            config.optimize_use_compile,
-            config.stream_use_optimized_decode,
-            config.warmup_enabled,
-            config.warmup_runs,
+            active_config.optimize_use_compile,
+            active_config.stream_use_optimized_decode,
+            active_config.warmup_enabled,
+            active_config.warmup_runs,
         )
         if should_preload:
-            pipeline.load()
+            try:
+                pipeline.load()
+            except Exception:
+                primary_model_id = (active_config.model_id or "").strip()
+                fallback_model_id = (active_config.fallback_model_id or "").strip()
+                fallback_speaker = (active_config.fallback_speaker or "").strip()
+                if not fallback_model_id or fallback_model_id == primary_model_id:
+                    logger.exception(
+                        "Custom bridge preload failed for model=%s and no distinct fallback model is configured",
+                        primary_model_id,
+                    )
+                    raise
+
+                logger.warning(
+                    "Custom bridge preload failed for model=%s; retrying with fallback model=%s",
+                    primary_model_id,
+                    fallback_model_id,
+                    exc_info=True,
+                )
+                active_config = replace(
+                    active_config,
+                    model_id=fallback_model_id,
+                    default_speaker=fallback_speaker or active_config.default_speaker,
+                    warmup_speaker=fallback_speaker or active_config.warmup_speaker,
+                )
+                pipeline = QwenCustomStreamingPipeline(config=active_config)
+                pipeline.load()
+                logger.info(
+                    "Custom bridge fallback model loaded model=%s speaker=%s",
+                    active_config.model_id,
+                    active_config.default_speaker,
+                )
 
         app.state.runtime = CustomBridgeRuntime(
-            config=config,
+            config=active_config,
             pipeline=pipeline,
             _active={},
             _lock=Lock(),
@@ -110,7 +142,7 @@ def create_app() -> FastAPI:
         logger.info(
             "Custom bridge ready active_model=%s default_model=%s speaker_count=%s",
             pipeline.active_model_id,
-            config.model_id,
+            active_config.model_id,
             len(pipeline.speaker_names()),
         )
         try:

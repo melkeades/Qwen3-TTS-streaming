@@ -16,6 +16,8 @@ class CustomBridgeConfig:
     cors_allow_credentials: bool
 
     model_id: str
+    fallback_model_id: str
+    fallback_speaker: str
     device_map: str
     dtype: str
     attn_implementation: str
@@ -95,6 +97,10 @@ class CustomBridgeConfig:
             repo_root=repo_root,
         )
 
+        default_speaker = os.getenv("CUSTOM_BRIDGE_DEFAULT_SPEAKER", "p3")
+        warmup_speaker = os.getenv("CUSTOM_BRIDGE_WARMUP_SPEAKER", default_speaker)
+        fallback_speaker = os.getenv("CUSTOM_BRIDGE_FALLBACK_SPEAKER", "Ryan")
+
         return cls(
             repo_root=repo_root,
             host=os.getenv("CUSTOM_BRIDGE_HOST", "0.0.0.0"),
@@ -103,12 +109,17 @@ class CustomBridgeConfig:
             cors_allow_methods=cls._env_csv("CUSTOM_BRIDGE_CORS_ALLOW_METHODS", "*"),
             cors_allow_headers=cls._env_csv("CUSTOM_BRIDGE_CORS_ALLOW_HEADERS", "*"),
             cors_allow_credentials=cls._env_bool("CUSTOM_BRIDGE_CORS_ALLOW_CREDENTIALS", False),
-            model_id=os.getenv("CUSTOM_BRIDGE_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"),
+            model_id=os.getenv("CUSTOM_BRIDGE_MODEL_ID", "output/test"),
+            fallback_model_id=os.getenv(
+                "CUSTOM_BRIDGE_FALLBACK_MODEL_ID",
+                "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
+            ),
+            fallback_speaker=fallback_speaker,
             device_map=os.getenv("CUSTOM_BRIDGE_DEVICE_MAP", "cuda:0"),
             dtype=os.getenv("CUSTOM_BRIDGE_DTYPE", "bfloat16"),
             attn_implementation=os.getenv("CUSTOM_BRIDGE_ATTN_IMPL", "flash_attention_2"),
             default_language=os.getenv("CUSTOM_BRIDGE_DEFAULT_LANGUAGE", "English"),
-            default_speaker=os.getenv("CUSTOM_BRIDGE_DEFAULT_SPEAKER", "Ryan"),
+            default_speaker=default_speaker,
             default_instruct=os.getenv("CUSTOM_BRIDGE_DEFAULT_INSTRUCT", ""),
             sample_rate=int(os.getenv("CUSTOM_BRIDGE_SAMPLE_RATE", "24000")),
             channels=int(os.getenv("CUSTOM_BRIDGE_CHANNELS", "1")),
@@ -136,7 +147,7 @@ class CustomBridgeConfig:
                 "Hello. This is a short warmup for custom voice streaming API.",
             ),
             warmup_language=os.getenv("CUSTOM_BRIDGE_WARMUP_LANGUAGE", "English"),
-            warmup_speaker=os.getenv("CUSTOM_BRIDGE_WARMUP_SPEAKER", "Ryan"),
+            warmup_speaker=warmup_speaker,
             warmup_instruct=os.getenv("CUSTOM_BRIDGE_WARMUP_INSTRUCT", "neutral and clear"),
             model_scan_roots=model_scan_roots,
             model_scan_max_depth=int(os.getenv("CUSTOM_BRIDGE_MODEL_SCAN_MAX_DEPTH", "3")),
