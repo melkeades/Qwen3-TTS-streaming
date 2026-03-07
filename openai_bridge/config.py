@@ -72,12 +72,14 @@ class BridgeConfig:
             client_html_path = repo_root / client_html_path
 
         return cls(
-            host=os.getenv("BRIDGE_HOST", "0.0.0.0"),
+            host=os.getenv("BRIDGE_HOST", "127.0.0.1"),
             port=int(os.getenv("BRIDGE_PORT", "8030")),
             cors_allow_origins=cls._env_csv("BRIDGE_CORS_ALLOW_ORIGINS", "*"),
             cors_allow_methods=cls._env_csv("BRIDGE_CORS_ALLOW_METHODS", "*"),
             cors_allow_headers=cls._env_csv("BRIDGE_CORS_ALLOW_HEADERS", "*"),
-            cors_allow_credentials=cls._env_bool("BRIDGE_CORS_ALLOW_CREDENTIALS", False),
+            cors_allow_credentials=cls._env_bool(
+                "BRIDGE_CORS_ALLOW_CREDENTIALS", False
+            ),
             model_id=os.getenv("BRIDGE_MODEL_ID", "Qwen/Qwen3-TTS-12Hz-1.7B-Base"),
             device_map=os.getenv("BRIDGE_DEVICE_MAP", "cuda:0"),
             dtype=os.getenv("BRIDGE_DTYPE", "bfloat16"),
@@ -92,8 +94,12 @@ class BridgeConfig:
             max_frames=int(os.getenv("BRIDGE_MAX_FRAMES", "10000")),
             optimize_use_compile=cls._env_bool("BRIDGE_OPT_USE_COMPILE", True),
             optimize_use_cuda_graphs=cls._env_bool("BRIDGE_OPT_USE_CUDA_GRAPHS", False),
-            optimize_compile_mode=os.getenv("BRIDGE_OPT_COMPILE_MODE", "reduce-overhead"),
-            optimize_use_fast_codebook=cls._env_bool("BRIDGE_OPT_USE_FAST_CODEBOOK", True),
+            optimize_compile_mode=os.getenv(
+                "BRIDGE_OPT_COMPILE_MODE", "reduce-overhead"
+            ),
+            optimize_use_fast_codebook=cls._env_bool(
+                "BRIDGE_OPT_USE_FAST_CODEBOOK", True
+            ),
             optimize_compile_codebook_predictor=cls._env_bool(
                 "BRIDGE_OPT_COMPILE_CODEBOOK_PREDICTOR", True
             ),

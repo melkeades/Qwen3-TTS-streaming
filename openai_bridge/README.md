@@ -181,6 +181,7 @@ Warmup:
 Paths:
 - `BRIDGE_VOICES_PATH` (default `openai_bridge/voices.json`)
 - `BRIDGE_CLIENT_HTML_PATH` (default `openai_bridge/client_dark_live.html`)
+- `BRIDGE_LOGS_DIR` (default `custom_bridge/logs`)
 
 ## CustomVoice Bridge Config (Environment Variables)
 
@@ -234,6 +235,7 @@ Warmup:
 
 Paths:
 - `CUSTOM_BRIDGE_CLIENT_HTML_PATH` (default `openai_bridge/client_custom_live.html`)
+- `CUSTOM_BRIDGE_LOGS_DIR` (default `custom_bridge/logs`)
 
 ## Smoke Tests
 

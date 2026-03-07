@@ -23,3 +23,4 @@ wheels/
 venv/
 env/
 output/
+custom_bridge/logs/*.log

@@ -87,7 +87,10 @@ class CustomBridgeConfig:
         repo_root = Path(__file__).resolve().parent.parent
 
         client_html_path = Path(
-            os.getenv("CUSTOM_BRIDGE_CLIENT_HTML_PATH", "openai_bridge/client_custom_live.html")
+            os.getenv(
+                "CUSTOM_BRIDGE_CLIENT_HTML_PATH",
+                "openai_bridge/client_custom_live.html",
+            )
         )
         if not client_html_path.is_absolute():
             client_html_path = repo_root / client_html_path
@@ -103,12 +106,14 @@ class CustomBridgeConfig:
 
         return cls(
             repo_root=repo_root,
-            host=os.getenv("CUSTOM_BRIDGE_HOST", "0.0.0.0"),
+            host=os.getenv("CUSTOM_BRIDGE_HOST", "127.0.0.1"),
             port=int(os.getenv("CUSTOM_BRIDGE_PORT", "8040")),
             cors_allow_origins=cls._env_csv("CUSTOM_BRIDGE_CORS_ALLOW_ORIGINS", "*"),
             cors_allow_methods=cls._env_csv("CUSTOM_BRIDGE_CORS_ALLOW_METHODS", "*"),
             cors_allow_headers=cls._env_csv("CUSTOM_BRIDGE_CORS_ALLOW_HEADERS", "*"),
-            cors_allow_credentials=cls._env_bool("CUSTOM_BRIDGE_CORS_ALLOW_CREDENTIALS", False),
+            cors_allow_credentials=cls._env_bool(
+                "CUSTOM_BRIDGE_CORS_ALLOW_CREDENTIALS", False
+            ),
             model_id=os.getenv("CUSTOM_BRIDGE_MODEL_ID", "output/test"),
             fallback_model_id=os.getenv(
                 "CUSTOM_BRIDGE_FALLBACK_MODEL_ID",
@@ -117,7 +122,9 @@ class CustomBridgeConfig:
             fallback_speaker=fallback_speaker,
             device_map=os.getenv("CUSTOM_BRIDGE_DEVICE_MAP", "cuda:0"),
             dtype=os.getenv("CUSTOM_BRIDGE_DTYPE", "bfloat16"),
-            attn_implementation=os.getenv("CUSTOM_BRIDGE_ATTN_IMPL", "flash_attention_2"),
+            attn_implementation=os.getenv(
+                "CUSTOM_BRIDGE_ATTN_IMPL", "flash_attention_2"
+            ),
             default_language=os.getenv("CUSTOM_BRIDGE_DEFAULT_LANGUAGE", "English"),
             default_speaker=default_speaker,
             default_instruct=os.getenv("CUSTOM_BRIDGE_DEFAULT_INSTRUCT", ""),
@@ -125,17 +132,27 @@ class CustomBridgeConfig:
             channels=int(os.getenv("CUSTOM_BRIDGE_CHANNELS", "1")),
             bits_per_sample=int(os.getenv("CUSTOM_BRIDGE_BITS_PER_SAMPLE", "16")),
             emit_every_frames=int(os.getenv("CUSTOM_BRIDGE_EMIT_EVERY_FRAMES", "4")),
-            decode_window_frames=int(os.getenv("CUSTOM_BRIDGE_DECODE_WINDOW_FRAMES", "80")),
+            decode_window_frames=int(
+                os.getenv("CUSTOM_BRIDGE_DECODE_WINDOW_FRAMES", "80")
+            ),
             overlap_samples=int(os.getenv("CUSTOM_BRIDGE_OVERLAP_SAMPLES", "0")),
             max_frames=int(os.getenv("CUSTOM_BRIDGE_MAX_FRAMES", "10000")),
             optimize_use_compile=cls._env_bool("CUSTOM_BRIDGE_OPT_USE_COMPILE", True),
-            optimize_use_cuda_graphs=cls._env_bool("CUSTOM_BRIDGE_OPT_USE_CUDA_GRAPHS", False),
-            optimize_compile_mode=os.getenv("CUSTOM_BRIDGE_OPT_COMPILE_MODE", "reduce-overhead"),
-            optimize_use_fast_codebook=cls._env_bool("CUSTOM_BRIDGE_OPT_USE_FAST_CODEBOOK", True),
+            optimize_use_cuda_graphs=cls._env_bool(
+                "CUSTOM_BRIDGE_OPT_USE_CUDA_GRAPHS", False
+            ),
+            optimize_compile_mode=os.getenv(
+                "CUSTOM_BRIDGE_OPT_COMPILE_MODE", "reduce-overhead"
+            ),
+            optimize_use_fast_codebook=cls._env_bool(
+                "CUSTOM_BRIDGE_OPT_USE_FAST_CODEBOOK", True
+            ),
             optimize_compile_codebook_predictor=cls._env_bool(
                 "CUSTOM_BRIDGE_OPT_COMPILE_CODEBOOK_PREDICTOR", True
             ),
-            optimize_compile_talker=cls._env_bool("CUSTOM_BRIDGE_OPT_COMPILE_TALKER", True),
+            optimize_compile_talker=cls._env_bool(
+                "CUSTOM_BRIDGE_OPT_COMPILE_TALKER", True
+            ),
             stream_use_optimized_decode=cls._env_bool(
                 "CUSTOM_BRIDGE_STREAM_USE_OPTIMIZED_DECODE", True
             ),
@@ -148,9 +165,13 @@ class CustomBridgeConfig:
             ),
             warmup_language=os.getenv("CUSTOM_BRIDGE_WARMUP_LANGUAGE", "English"),
             warmup_speaker=warmup_speaker,
-            warmup_instruct=os.getenv("CUSTOM_BRIDGE_WARMUP_INSTRUCT", "neutral and clear"),
+            warmup_instruct=os.getenv(
+                "CUSTOM_BRIDGE_WARMUP_INSTRUCT", "neutral and clear"
+            ),
             model_scan_roots=model_scan_roots,
-            model_scan_max_depth=int(os.getenv("CUSTOM_BRIDGE_MODEL_SCAN_MAX_DEPTH", "3")),
+            model_scan_max_depth=int(
+                os.getenv("CUSTOM_BRIDGE_MODEL_SCAN_MAX_DEPTH", "3")
+            ),
             additional_model_ids=cls._env_csv("CUSTOM_BRIDGE_ADDITIONAL_MODEL_IDS", ""),
             startup_empty=cls._env_bool("CUSTOM_BRIDGE_START_EMPTY", False),
             client_html_path=client_html_path,
