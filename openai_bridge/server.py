@@ -12,7 +12,7 @@ from typing import Any
 from fastapi import FastAPI, HTTPException
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse, JSONResponse, StreamingResponse
+from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
 
 from .config import BridgeConfig
 from .pipeline import QwenStreamingPipeline
@@ -126,6 +126,10 @@ def create_app() -> FastAPI:
     async def index() -> FileResponse:
         runtime: BridgeRuntime = app.state.runtime
         return FileResponse(runtime.config.client_html_path)
+
+    @app.get("/favicon.ico", include_in_schema=False)
+    async def favicon() -> Response:
+        return Response(status_code=204)
 
     @app.get("/healthz")
     async def healthz() -> dict[str, Any]:
