@@ -44,6 +44,8 @@ Custom bridge only:
 
 - `GET /v1/speakers?model=...` (speaker IDs, incl. checkpoint `config.json` parsing)
 - `POST /v1/models/unload?model=...` and `?all=true` (manual VRAM release)
+- Backend text session buffering via `session_id` + `end_of_message`
+- `POST /v1/audio/session/clear?session_id=...` (drop buffered text without synthesis)
 - Multi-model discovery from `output/` + runtime model cache reuse
 - Startup readiness metadata (`startup_ready`) in health output
 
@@ -52,6 +54,11 @@ Request compatibility notes:
 - OpenAI-style `instructions` is supported.
 - Legacy `instruct` is still accepted for backward compatibility.
 - Custom bridge treats `voice` as speaker id (and also accepts `speaker` alias).
+- Custom bridge buffered session mode:
+  - Send `session_id` with each text chunk to buffer on the backend.
+  - Keep `end_of_message=false` for intermediate chunks; server returns `202 Accepted`.
+  - Send the final chunk with `end_of_message=true`; server concatenates buffered text and streams one synthesized response.
+  - Buffered chunks in the same session must keep the same synthesis settings (`model`, `voice`/`speaker`, language, instructions, format, decode params).
 
 Validation scripts:
 

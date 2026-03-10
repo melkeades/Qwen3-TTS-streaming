@@ -36,6 +36,23 @@ class SpeechSynthesisParams(BaseModel):
     overlap_samples: Optional[int] = Field(default=None, ge=0)
     max_frames: Optional[int] = Field(default=None, ge=1)
     use_optimized_decode: Optional[bool] = None
+    session_id: Optional[str] = Field(default=None, min_length=1)
+    end_of_message: bool = False
+
+
+class BufferedSessionResponse(BaseModel):
+    accepted: bool = True
+    session_id: str
+    buffered_chunks: int
+    buffered_chars: int
+    end_of_message: bool = False
+
+
+class ClearSessionResponse(BaseModel):
+    cleared: bool
+    session_id: str
+    dropped_chunks: int = 0
+    dropped_chars: int = 0
 
 
 class StopResponse(BaseModel):

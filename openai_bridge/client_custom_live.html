@@ -289,11 +289,20 @@
             <label for="firstChunkChars">First-segment char cap (TTFB)</label>
             <input id="firstChunkChars" type="number" min="20" value="110" />
           </div>
+          <div>
+            <label for="sessionId">Session ID (bridge-only)</label>
+            <input id="sessionId" placeholder="auto-generated when backend buffer is enabled" />
+          </div>
         </div>
 
         <div class="inline-toggle">
           <input id="segmentMode" type="checkbox" />
           <label for="segmentMode" style="margin: 0;">Client-side segmentation (experimental). Prefer backend chunking for correctness.</label>
+        </div>
+
+        <div class="inline-toggle">
+          <input id="backendBuffer" type="checkbox" checked />
+          <label for="backendBuffer" style="margin: 0;">Use backend text buffering with one `session_id` across chunks (bridge extension, not official OpenAI `/v1/audio/speech`).</label>
         </div>
 
         <div style="margin-top: 12px;">
@@ -355,6 +364,8 @@
       segmentMode: document.getElementById("segmentMode"),
       maxChunkChars: document.getElementById("maxChunkChars"),
       firstChunkChars: document.getElementById("firstChunkChars"),
+      sessionId: document.getElementById("sessionId"),
+      backendBuffer: document.getElementById("backendBuffer"),
       prompt: document.getElementById("prompt"),
       runBtn: document.getElementById("runBtn"),
       warmupBtn: document.getElementById("warmupBtn"),
@@ -394,7 +405,8 @@
       bitsPerSample: DEFAULT_BITS,
       pcmRemainder: new Uint8Array(0),
       wavHeaderBuffer: new Uint8Array(0),
-      wavHeaderDone: false
+      wavHeaderDone: false,
+      activeSessionId: null
     };
 
     function nowMs() {
@@ -416,6 +428,23 @@
     function setStatus(text, cls = "") {
       el.status.textContent = text;
       el.status.className = `status ${cls}`.trim();
+    }
+
+    function createSessionId() {
+      if (window.crypto && typeof window.crypto.randomUUID === "function") {
+        return window.crypto.randomUUID();
+      }
+      return `sess-${Date.now()}-${Math.random().toString(36).slice(2, 10)}`;
+    }
+
+    function resolveSessionId() {
+      const existing = (el.sessionId.value || "").trim();
+      if (existing) {
+        return existing;
+      }
+      const generated = createSessionId();
+      el.sessionId.value = generated;
+      return generated;
     }
 
     function appendLog(text) {
@@ -914,9 +943,38 @@
       return merged.slice(44);
     }
 
-    async function streamOneSegment(segmentText, segmentIndex, segmentCount) {
+    async function clearBufferedSession(sessionId, quiet = false) {
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      const key = String(sessionId || "").trim();
+      if (!baseUrl || !key) {
+        return;
+      }
+
+      try {
+        const resp = await fetch(
+          `${baseUrl}/v1/audio/session/clear?session_id=${encodeURIComponent(key)}`,
+          { method: "POST" }
+        );
+        if (!resp.ok) {
+          const detail = await resp.text();
+          throw new Error(`${resp.status} ${resp.statusText} ${detail}`.trim());
+        }
+        if (!quiet) {
+          appendLog(`cleared buffered session ${key}`);
+        }
+      } catch (error) {
+        if (!quiet) {
+          appendLog(`session clear failed: ${error.message}`);
+        }
+      }
+    }
+
+    async function streamOneSegment(segmentText, segmentIndex, segmentCount, options = {}) {
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
       const speaker = (el.voice.value || "").trim();
+      const sessionId = String(options.sessionId || "").trim();
+      const expectAudio = options.expectAudio !== false;
+      const endOfMessage = options.endOfMessage !== false;
       const payload = {
         model: selectedModelId(),
         input: segmentText,
@@ -929,6 +987,10 @@
         payload.voice = speaker;
         payload.speaker = speaker;
       }
+      if (sessionId) {
+        payload.session_id = sessionId;
+        payload.end_of_message = endOfMessage;
+      }
 
       const response = await fetch(`${baseUrl}/v1/audio/speech`, {
         method: "POST",
@@ -939,7 +1001,7 @@
 
       const headerAt = nowMs();
       state.stats.httpStatus = response.status;
-      if (!Number.isFinite(state.stats.ttfbHeadersMs)) {
+      if (expectAudio && !Number.isFinite(state.stats.ttfbHeadersMs)) {
         state.stats.ttfbHeadersMs = headerAt - state.requestStartMs;
       }
 
@@ -949,6 +1011,25 @@
           throw new DOMException("Aborted", "AbortError");
         }
         throw new Error(`${response.status} ${response.statusText} ${detail}`.trim());
+      }
+
+      if (!expectAudio) {
+        let bufferedInfo = "";
+        try {
+          const ack = await response.json();
+          const bufferedChunks = Number(ack?.buffered_chunks || 0);
+          const bufferedChars = Number(ack?.buffered_chars || 0);
+          bufferedInfo = `, buffered=${bufferedChunks} chunk(s), ${bufferedChars} chars`;
+        } catch (_) {
+          // Ignore non-JSON acks.
+        }
+        appendLog(
+          `segment ${segmentIndex + 1}/${segmentCount} buffered via backend session ${sessionId}${bufferedInfo}`
+        );
+        setStatus(`Buffered segment ${segmentIndex + 1}/${segmentCount} on backend...`);
+        updateDerivedStats();
+        updateStats();
+        return;
       }
 
       if (!response.body) {
@@ -967,7 +1048,7 @@
       const reader = response.body.getReader();
 
       appendLog(
-        `segment ${segmentIndex + 1}/${segmentCount} started (${segmentText.length} chars), speaker=${speaker || "(server default)"}, language=${payload.language}`
+        `segment ${segmentIndex + 1}/${segmentCount} started (${segmentText.length} chars), speaker=${speaker || "(server default)"}, language=${payload.language}${sessionId ? `, session=${sessionId}` : ""}`
       );
       setStatus(`Streaming segment ${segmentIndex + 1}/${segmentCount}...`);
 
@@ -1108,22 +1189,35 @@
         const maxChars = Number.parseInt(el.maxChunkChars.value || "280", 10);
         const firstChunkChars = Number.parseInt(el.firstChunkChars.value || "110", 10);
         const segmentedMode = Boolean(el.segmentMode.checked);
+        const useBackendBuffer = Boolean(el.backendBuffer.checked);
 
         const segments = buildSegments(prompt, maxChars, firstChunkChars, segmentedMode);
         state.stats.segments = segments.length;
         updateStats();
 
-        appendLog(`stream mode: ${el.responseFormat.value}, segmented: ${segmentedMode}`);
+        const sessionId = useBackendBuffer ? resolveSessionId() : "";
+        state.activeSessionId = sessionId || null;
+
+        appendLog(`stream mode: ${el.responseFormat.value}, segmented: ${segmentedMode}, backend_buffer: ${useBackendBuffer}`);
         appendLog(`segments: ${segments.length}`);
+        if (sessionId) {
+          appendLog(`session id: ${sessionId}`);
+        }
 
         for (let i = 0; i < segments.length; i++) {
           if (state.abortController.signal.aborted) {
             throw new DOMException("Aborted", "AbortError");
           }
-          await streamOneSegment(segments[i], i, segments.length);
+          const isFinalSegment = i === segments.length - 1;
+          await streamOneSegment(segments[i], i, segments.length, {
+            sessionId,
+            endOfMessage: useBackendBuffer ? isFinalSegment : true,
+            expectAudio: useBackendBuffer ? isFinalSegment : true
+          });
         }
 
         completed = true;
+        state.activeSessionId = null;
         updateDerivedStats();
         updateStats();
         setStatus("Stream complete. Finishing playback...", "accent");
@@ -1138,6 +1232,10 @@
         }
       } finally {
         state.abortController = null;
+        if (!completed && state.activeSessionId) {
+          await clearBufferedSession(state.activeSessionId, true);
+        }
+        state.activeSessionId = null;
         const hadQueuedAudio = await waitForPlaybackDrain();
         if (completed && hadQueuedAudio && !state.stopRequested) {
           setStatus("Playback complete.", "accent");

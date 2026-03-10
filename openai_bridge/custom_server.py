@@ -17,6 +17,8 @@ from fastapi.responses import FileResponse, JSONResponse, Response, StreamingRes
 from .custom_config import CustomBridgeConfig
 from .custom_pipeline import QwenCustomStreamingPipeline
 from .schemas import (
+    BufferedSessionResponse,
+    ClearSessionResponse,
     ErrorObject,
     ModelListResponse,
     ModelObject,
@@ -28,11 +30,75 @@ from .schemas import (
 logger = logging.getLogger(__name__)
 
 
+def _effective_speaker(req: SpeechSynthesisParams) -> str:
+    return (req.speaker or req.voice).strip()
+
+
+def _effective_instructions(req: SpeechSynthesisParams) -> str | None:
+    value = req.instructions if req.instructions is not None else req.instruct
+    if value is None:
+        return None
+    return value
+
+
+@dataclass
+class BufferedSpeechSession:
+    session_id: str
+    chunks: list[str]
+    model: str
+    voice: str
+    speaker: str | None
+    instructions: str | None
+    instruct: str | None
+    language: str | None
+    response_format: str
+    speed: float
+    emit_every_frames: int | None
+    decode_window_frames: int | None
+    overlap_samples: int | None
+    max_frames: int | None
+    use_optimized_decode: bool | None
+
+    @property
+    def buffered_chunks(self) -> int:
+        return len(self.chunks)
+
+    @property
+    def buffered_chars(self) -> int:
+        return sum(len(chunk) for chunk in self.chunks)
+
+    def append(self, text: str) -> None:
+        self.chunks.append(text)
+
+    def build_request(self, req: SpeechSynthesisParams) -> SpeechSynthesisParams:
+        return req.model_copy(
+            update={
+                "input": "".join(self.chunks),
+                "model": self.model,
+                "voice": self.voice,
+                "speaker": self.speaker,
+                "instructions": self.instructions,
+                "instruct": self.instruct,
+                "language": self.language,
+                "response_format": self.response_format,
+                "speed": self.speed,
+                "emit_every_frames": self.emit_every_frames,
+                "decode_window_frames": self.decode_window_frames,
+                "overlap_samples": self.overlap_samples,
+                "max_frames": self.max_frames,
+                "use_optimized_decode": self.use_optimized_decode,
+                "session_id": None,
+                "end_of_message": False,
+            }
+        )
+
+
 @dataclass
 class CustomBridgeRuntime:
     config: CustomBridgeConfig
     pipeline: QwenCustomStreamingPipeline
     _active: dict[str, Event]
+    _buffered_sessions: dict[str, BufferedSpeechSession]
     _lock: Lock
 
     def register_stream(self) -> tuple[str, Event]:
@@ -56,6 +122,106 @@ class CustomBridgeRuntime:
     def active_count(self) -> int:
         with self._lock:
             return len(self._active)
+
+    def buffered_session_count(self) -> int:
+        with self._lock:
+            return len(self._buffered_sessions)
+
+    def upsert_buffered_session(self, req: SpeechSynthesisParams) -> BufferedSpeechSession:
+        session_id = (req.session_id or "").strip()
+        if not session_id:
+            raise ValueError("Missing session_id")
+
+        with self._lock:
+            session = self._buffered_sessions.get(session_id)
+            if session is None:
+                session = BufferedSpeechSession(
+                    session_id=session_id,
+                    chunks=[],
+                    model=req.model,
+                    voice=_effective_speaker(req),
+                    speaker=_effective_speaker(req),
+                    instructions=_effective_instructions(req),
+                    instruct=_effective_instructions(req),
+                    language=req.language,
+                    response_format=req.response_format,
+                    speed=req.speed,
+                    emit_every_frames=req.emit_every_frames,
+                    decode_window_frames=req.decode_window_frames,
+                    overlap_samples=req.overlap_samples,
+                    max_frames=req.max_frames,
+                    use_optimized_decode=req.use_optimized_decode,
+                )
+                self._buffered_sessions[session_id] = session
+            else:
+                self._validate_buffered_session_locked(session, req)
+
+            session.append(req.input)
+            return BufferedSpeechSession(
+                session_id=session.session_id,
+                chunks=list(session.chunks),
+                model=session.model,
+                voice=session.voice,
+                speaker=session.speaker,
+                instructions=session.instructions,
+                instruct=session.instruct,
+                language=session.language,
+                response_format=session.response_format,
+                speed=session.speed,
+                emit_every_frames=session.emit_every_frames,
+                decode_window_frames=session.decode_window_frames,
+                overlap_samples=session.overlap_samples,
+                max_frames=session.max_frames,
+                use_optimized_decode=session.use_optimized_decode,
+            )
+
+    def pop_buffered_session(self, session_id: str) -> BufferedSpeechSession | None:
+        key = (session_id or "").strip()
+        if not key:
+            return None
+        with self._lock:
+            return self._buffered_sessions.pop(key, None)
+
+    def clear_buffered_session(self, session_id: str) -> ClearSessionResponse:
+        session = self.pop_buffered_session(session_id)
+        if session is None:
+            return ClearSessionResponse(cleared=False, session_id=session_id)
+        return ClearSessionResponse(
+            cleared=True,
+            session_id=session_id,
+            dropped_chunks=session.buffered_chunks,
+            dropped_chars=session.buffered_chars,
+        )
+
+    @staticmethod
+    def _validate_buffered_session_locked(
+        session: BufferedSpeechSession, req: SpeechSynthesisParams
+    ) -> None:
+        mismatches: list[str] = []
+
+        def check(name: str, existing: Any, incoming: Any) -> None:
+            if existing != incoming:
+                mismatches.append(name)
+
+        check("model", session.model, req.model)
+        check("voice", session.voice, _effective_speaker(req))
+        check("speaker", session.speaker, _effective_speaker(req))
+        check("instructions", session.instructions, _effective_instructions(req))
+        check("instruct", session.instruct, _effective_instructions(req))
+        check("language", session.language, req.language)
+        check("response_format", session.response_format, req.response_format)
+        check("speed", session.speed, req.speed)
+        check("emit_every_frames", session.emit_every_frames, req.emit_every_frames)
+        check("decode_window_frames", session.decode_window_frames, req.decode_window_frames)
+        check("overlap_samples", session.overlap_samples, req.overlap_samples)
+        check("max_frames", session.max_frames, req.max_frames)
+        check("use_optimized_decode", session.use_optimized_decode, req.use_optimized_decode)
+
+        if mismatches:
+            joined = ", ".join(mismatches)
+            raise ValueError(
+                f"Buffered session '{session.session_id}' received conflicting synthesis fields: {joined}"
+            )
 
 
 def _error_response(
@@ -137,6 +303,7 @@ def create_app() -> FastAPI:
             config=active_config,
             pipeline=pipeline,
             _active={},
+            _buffered_sessions={},
             _lock=Lock(),
         )
         logger.info(
@@ -206,6 +373,7 @@ def create_app() -> FastAPI:
             "speaker_count": len(speakers),
             "speakers": speakers,
             "active_streams": runtime.active_count(),
+            "buffered_sessions": runtime.buffered_session_count(),
         }
 
     @app.get("/v1/models", response_model=ModelListResponse)
@@ -314,9 +482,43 @@ def create_app() -> FastAPI:
         active_before = runtime.cancel_all()
         return StopResponse(stopped=True, active_before=active_before)
 
+    @app.post("/v1/audio/session/clear", response_model=ClearSessionResponse)
+    async def v1_audio_session_clear(session_id: str | None = None) -> ClearSessionResponse:
+        requested_session = (session_id or "").strip()
+        if not requested_session:
+            raise HTTPException(status_code=400, detail="Missing session id (?session_id=<id>).")
+        runtime: CustomBridgeRuntime = app.state.runtime
+        return runtime.clear_buffered_session(requested_session)
+
     @app.post("/v1/audio/speech")
     async def v1_audio_speech(req: SpeechSynthesisParams):
         runtime: CustomBridgeRuntime = app.state.runtime
+
+        session_id = (req.session_id or "").strip()
+        if session_id:
+            try:
+                buffered = runtime.upsert_buffered_session(req)
+            except ValueError as exc:
+                raise HTTPException(status_code=409, detail=str(exc)) from exc
+
+            if not req.end_of_message:
+                return JSONResponse(
+                    status_code=202,
+                    content=BufferedSessionResponse(
+                        session_id=session_id,
+                        buffered_chunks=buffered.buffered_chunks,
+                        buffered_chars=buffered.buffered_chars,
+                        end_of_message=False,
+                    ).model_dump(),
+                )
+
+            committed = runtime.pop_buffered_session(session_id)
+            if committed is None or committed.buffered_chars <= 0:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Buffered session '{session_id}' is empty.",
+                )
+            req = committed.build_request(req)
 
         req_model = req.model.strip()
         active_model = runtime.pipeline.active_model_id
