@@ -2637,6 +2637,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         max_frames: int = 10000,
         # Optimization flags
         use_optimized_decode: bool = True,
+        # Cross-request continuation
+        external_ref_code_context: Optional[torch.Tensor] = None,
+        capture_ref_code_context_frames: int = 0,
     ) -> Generator[tuple[np.ndarray, int], None, None]:
         """
         Stream audio generation, yielding PCM chunks as they are generated.
@@ -2663,6 +2666,9 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
         Yields:
             tuple[np.ndarray, int]: (pcm_chunk as float32 array, sample_rate)
         """
+        # Reset captured stream tail context for this run.
+        self._last_stream_generated_ref_code_context = None
+
         # Build talker inputs
         talker_input_embeds, talker_attention_mask, trailing_text_hiddens, tts_pad_embed = \
             self._build_talker_inputs(
@@ -2719,11 +2725,14 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             token = torch.argmax(last_logits, dim=-1)
         # Debug removed for performance: first token sampled
 
-        # Extract ref_code for decoder context (if in ICL mode)
-        # This provides stable context from the start, eliminating early voice artifacts
+        # Extract ref_code for decoder context.
+        # Priority: external continuation context > ICL ref_code > synthetic silence context.
         ref_code_context: Optional[torch.Tensor] = None
         ref_code_frames: int = 0
-        if voice_clone_prompt is not None:
+        if external_ref_code_context is not None and external_ref_code_context.shape[0] > 0:
+            ref_code_context = external_ref_code_context.to(self.talker.device)
+            ref_code_frames = ref_code_context.shape[0]
+        elif voice_clone_prompt is not None:
             ref_code_list = voice_clone_prompt.get("ref_code", None)
             icl_mode_list = voice_clone_prompt.get("icl_mode", None)
             if ref_code_list is not None and icl_mode_list is not None:
@@ -2750,6 +2759,15 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             if silence_ctx is not None:
                 ref_code_context = silence_ctx
                 ref_code_frames = ref_code_context.shape[0]
+
+        capture_ref_code_context_frames = max(0, int(capture_ref_code_context_frames))
+
+        def _capture_generated_ref_context() -> None:
+            if capture_ref_code_context_frames <= 0 or not codes_buffer:
+                return
+            tail_start = max(0, len(codes_buffer) - capture_ref_code_context_frames)
+            tail_codes = torch.stack(codes_buffer[tail_start:], dim=0).detach().cpu().contiguous()
+            self._last_stream_generated_ref_code_context = tail_codes
 
         # Decode loop
         codes_buffer: list[torch.Tensor] = []
@@ -2852,6 +2870,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
             total_frames_emitted = len(codes_buffer)  # Mark these frames as emitted
             yield chunk, sr
 
+        _capture_generated_ref_context()
+
         # Flush: decode only remaining frames that haven't been emitted yet
         remaining_frames = len(codes_buffer) - total_frames_emitted
         if remaining_frames > 0:
@@ -2884,6 +2904,8 @@ class Qwen3TTSForConditionalGeneration(Qwen3TTSPreTrainedModel, GenerationMixin)
 
             # Debug removed for performance: flush done
             yield wav, sr
+
+        _capture_generated_ref_context()
 
 
 __all__ = [

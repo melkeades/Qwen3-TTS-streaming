@@ -36,6 +36,10 @@ class SpeechSynthesisParams(BaseModel):
     overlap_samples: Optional[int] = Field(default=None, ge=0)
     max_frames: Optional[int] = Field(default=None, ge=1)
     use_optimized_decode: Optional[bool] = None
+    continuation_id: Optional[str] = Field(default=None, min_length=1)
+    continuation_mode: Literal["off", "acoustic_tail"] = "off"
+    continuation_reset: Optional[bool] = False
+    continuation_frames: Optional[int] = Field(default=None, ge=1)
     session_id: Optional[str] = Field(default=None, min_length=1)
     end_of_message: bool = False
 

@@ -56,8 +56,11 @@ Request compatibility notes:
 - Custom bridge treats `voice` as speaker id (and also accepts `speaker` alias).
 - Custom bridge buffered session mode:
   - Send `session_id` with each text chunk to buffer on the backend.
-  - Keep `end_of_message=false` for intermediate chunks; server returns `202 Accepted`.
-  - Send the final chunk with `end_of_message=true`; server concatenates buffered text and streams one synthesized response.
+  - The first chunk is speakable immediately once received; later chunks are emitted when the backend has a ready segment.
+  - Follow-up chunks are cut on strong sentence endings (`.`, `!`, `?`) during dynamic backend chunking.
+  - If a request does not yet yield a speakable segment, server returns `202 Accepted`.
+  - `end_of_message=true` flushes any trailing unsent text in the session.
+  - Backend continuation is session-owned and uses cached acoustic tail state to improve cross-request continuity.
   - Buffered chunks in the same session must keep the same synthesis settings (`model`, `voice`/`speaker`, language, instructions, format, decode params).
 
 Validation scripts:

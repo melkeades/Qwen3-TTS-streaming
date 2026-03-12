@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import asyncio
 import logging
+import re
 import time
 import uuid
 from contextlib import asynccontextmanager
@@ -28,6 +29,7 @@ from .schemas import (
 )
 
 logger = logging.getLogger(__name__)
+_SENTENCE_RE = re.compile(r".*?[.!?]+(?=\s|$)", re.DOTALL)
 
 
 def _effective_speaker(req: SpeechSynthesisParams) -> str:
@@ -41,10 +43,24 @@ def _effective_instructions(req: SpeechSynthesisParams) -> str | None:
     return value
 
 
+def _extract_ready_sentences(text: str) -> tuple[list[str], str]:
+    raw = text or ""
+    ready: list[str] = []
+    last_end = 0
+    for match in _SENTENCE_RE.finditer(raw):
+        sentence = match.group(0).strip()
+        if sentence:
+            ready.append(sentence)
+        last_end = match.end()
+    return ready, raw[last_end:]
+
+
 @dataclass
 class BufferedSpeechSession:
     session_id: str
     chunks: list[str]
+    pending_text: str
+    generated_segments: int
     model: str
     voice: str
     speaker: str | None
@@ -65,28 +81,43 @@ class BufferedSpeechSession:
 
     @property
     def buffered_chars(self) -> int:
+        return len(self.pending_text)
+
+    @property
+    def total_received_chars(self) -> int:
         return sum(len(chunk) for chunk in self.chunks)
 
     def append(self, text: str) -> None:
         self.chunks.append(text)
+        self.pending_text += text
 
-    def build_request(self, req: SpeechSynthesisParams) -> SpeechSynthesisParams:
+    def build_request(
+        self,
+        req: SpeechSynthesisParams,
+        *,
+        text: str,
+        response_format: str | None = None,
+        continuation_reset: bool = False,
+    ) -> SpeechSynthesisParams:
         return req.model_copy(
             update={
-                "input": "".join(self.chunks),
+                "input": text,
                 "model": self.model,
                 "voice": self.voice,
                 "speaker": self.speaker,
                 "instructions": self.instructions,
                 "instruct": self.instruct,
                 "language": self.language,
-                "response_format": self.response_format,
+                "response_format": response_format or self.response_format,
                 "speed": self.speed,
                 "emit_every_frames": self.emit_every_frames,
                 "decode_window_frames": self.decode_window_frames,
                 "overlap_samples": self.overlap_samples,
                 "max_frames": self.max_frames,
                 "use_optimized_decode": self.use_optimized_decode,
+                "continuation_id": self.session_id,
+                "continuation_mode": "acoustic_tail",
+                "continuation_reset": continuation_reset,
                 "session_id": None,
                 "end_of_message": False,
             }
@@ -138,6 +169,8 @@ class CustomBridgeRuntime:
                 session = BufferedSpeechSession(
                     session_id=session_id,
                     chunks=[],
+                    pending_text="",
+                    generated_segments=0,
                     model=req.model,
                     voice=_effective_speaker(req),
                     speaker=_effective_speaker(req),
@@ -160,6 +193,8 @@ class CustomBridgeRuntime:
             return BufferedSpeechSession(
                 session_id=session.session_id,
                 chunks=list(session.chunks),
+                pending_text=session.pending_text,
+                generated_segments=session.generated_segments,
                 model=session.model,
                 voice=session.voice,
                 speaker=session.speaker,
@@ -174,6 +209,81 @@ class CustomBridgeRuntime:
                 max_frames=session.max_frames,
                 use_optimized_decode=session.use_optimized_decode,
             )
+
+    def plan_session_segments(
+        self,
+        session_id: str,
+        *,
+        end_of_message: bool,
+    ) -> tuple[BufferedSpeechSession | None, list[str], bool]:
+        key = (session_id or "").strip()
+        if not key:
+            return None, [], False
+
+        with self._lock:
+            session = self._buffered_sessions.get(key)
+            if session is None:
+                return None, [], False
+
+            segments: list[str] = []
+            if session.generated_segments == 0:
+                first = session.pending_text.strip()
+                if first:
+                    segments.append(first)
+                    session.pending_text = ""
+            else:
+                ready, remaining = _extract_ready_sentences(session.pending_text)
+                segments.extend(ready)
+                session.pending_text = remaining
+
+            if end_of_message:
+                tail = session.pending_text.strip()
+                if tail:
+                    segments.append(tail)
+                session.pending_text = ""
+
+            close_after_stream = bool(end_of_message and not session.pending_text.strip())
+
+            return (
+                BufferedSpeechSession(
+                    session_id=session.session_id,
+                    chunks=list(session.chunks),
+                    pending_text=session.pending_text,
+                    generated_segments=session.generated_segments,
+                    model=session.model,
+                    voice=session.voice,
+                    speaker=session.speaker,
+                    instructions=session.instructions,
+                    instruct=session.instruct,
+                    language=session.language,
+                    response_format=session.response_format,
+                    speed=session.speed,
+                    emit_every_frames=session.emit_every_frames,
+                    decode_window_frames=session.decode_window_frames,
+                    overlap_samples=session.overlap_samples,
+                    max_frames=session.max_frames,
+                    use_optimized_decode=session.use_optimized_decode,
+                ),
+                segments,
+                close_after_stream,
+            )
+
+    def mark_session_segments_generated(self, session_id: str, count: int) -> None:
+        key = (session_id or "").strip()
+        if not key or count <= 0:
+            return
+        with self._lock:
+            session = self._buffered_sessions.get(key)
+            if session is None:
+                return
+            session.generated_segments += int(count)
+
+    def has_buffered_session(self, session_id: str) -> bool:
+        key = (session_id or "").strip()
+        if not key:
+            return False
+        with self._lock:
+            return key in self._buffered_sessions
 
     def pop_buffered_session(self, session_id: str) -> BufferedSpeechSession | None:
         key = (session_id or "").strip()
@@ -368,6 +478,15 @@ def create_app() -> FastAPI:
             "default_speaker": runtime.config.default_speaker,
             "default_language": runtime.config.default_language,
             "stream_use_optimized_decode": runtime.config.stream_use_optimized_decode,
+            "continuation_default_frames": runtime.config.continuation_default_frames,
+            "continuation_cache_ttl_sec": runtime.config.continuation_cache_ttl_sec,
+            "continuation_cache_max_entries": runtime.config.continuation_cache_max_entries,
+            "continuation_sampling_enabled": runtime.config.continuation_sampling_enabled,
+            "continuation_sampling_temperature": runtime.config.continuation_sampling_temperature,
+            "continuation_sampling_top_k": runtime.config.continuation_sampling_top_k,
+            "continuation_sampling_subtalker_temperature": runtime.config.continuation_sampling_subtalker_temperature,
+            "continuation_sampling_subtalker_top_k": runtime.config.continuation_sampling_subtalker_top_k,
+            "continuation_followup_greedy_enabled": runtime.config.continuation_followup_greedy_enabled,
             "warmup_enabled": runtime.config.warmup_enabled,
             "warmup_runs": runtime.config.warmup_runs,
             "speaker_count": len(speakers),
@@ -488,39 +607,53 @@ def create_app() -> FastAPI:
         if not requested_session:
             raise HTTPException(status_code=400, detail="Missing session id (?session_id=<id>).")
         runtime: CustomBridgeRuntime = app.state.runtime
-        return runtime.clear_buffered_session(requested_session)
+        cleared = runtime.clear_buffered_session(requested_session)
+        runtime.pipeline.clear_continuation_session(requested_session)
+        return cleared
 
     @app.post("/v1/audio/speech")
     async def v1_audio_speech(req: SpeechSynthesisParams):
         runtime: CustomBridgeRuntime = app.state.runtime
 
         session_id = (req.session_id or "").strip()
+        session_snapshot: BufferedSpeechSession | None = None
+        session_segments: list[str] | None = None
+        close_after_stream = False
         if session_id:
             try:
-                buffered = runtime.upsert_buffered_session(req)
+                runtime.upsert_buffered_session(req)
             except ValueError as exc:
                 raise HTTPException(status_code=409, detail=str(exc)) from exc
 
-            if not req.end_of_message:
+            session_snapshot, session_segments, close_after_stream = runtime.plan_session_segments(
+                session_id,
+                end_of_message=req.end_of_message,
+            )
+            if session_snapshot is None:
+                raise HTTPException(
+                    status_code=400,
+                    detail=f"Buffered session '{session_id}' is not available.",
+                )
+
+            if not session_segments:
                 return JSONResponse(
                     status_code=202,
                     content=BufferedSessionResponse(
                         session_id=session_id,
-                        buffered_chunks=buffered.buffered_chunks,
-                        buffered_chars=buffered.buffered_chars,
-                        end_of_message=False,
+                        buffered_chunks=session_snapshot.buffered_chunks,
+                        buffered_chars=session_snapshot.buffered_chars,
+                        end_of_message=req.end_of_message,
                     ).model_dump(),
                 )
 
-            committed = runtime.pop_buffered_session(session_id)
-            if committed is None or committed.buffered_chars <= 0:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"Buffered session '{session_id}' is empty.",
-                )
-            req = committed.build_request(req)
+            req_model = session_snapshot.model.strip()
+            req_language = session_snapshot.language or runtime.config.default_language
+            response_format = session_snapshot.response_format
+        else:
+            req_model = req.model.strip()
+            req_language = req.language or runtime.config.default_language
+            response_format = req.response_format
 
-        req_model = req.model.strip()
         active_model = runtime.pipeline.active_model_id
         if active_model and req_model != active_model and runtime.active_count() > 0:
             raise HTTPException(
@@ -535,7 +668,13 @@ def create_app() -> FastAPI:
         except ValueError as exc:
             raise HTTPException(status_code=400, detail=str(exc)) from exc
 
-        speaker = (req.speaker or req.voice or runtime.config.default_speaker).strip()
+        speaker = (
+            (session_snapshot.speaker if session_snapshot is not None else None)
+            or (session_snapshot.voice if session_snapshot is not None else None)
+            or req.speaker
+            or req.voice
+            or runtime.config.default_speaker
+        ).strip()
         if not speaker:
             raise HTTPException(
                 status_code=400,
@@ -552,28 +691,56 @@ def create_app() -> FastAPI:
                 ),
             )
 
+        stream_requests: list[SpeechSynthesisParams]
+        if session_snapshot is not None and session_segments is not None:
+            stream_requests = []
+            for index, segment_text in enumerate(session_segments):
+                segment_format = response_format if index == 0 else "pcm"
+                stream_requests.append(
+                    session_snapshot.build_request(
+                        req,
+                        text=segment_text,
+                        response_format=segment_format,
+                        continuation_reset=bool(
+                            session_snapshot.generated_segments == 0 and index == 0
+                        ),
+                    )
+                )
+        else:
+            stream_requests = [req]
+
         stream_id, cancel_event = runtime.register_stream()
 
         async def iterator():
             try:
-                for chunk in runtime.pipeline.stream_audio_chunks(
-                    req=req,
-                    cancel_event=cancel_event,
-                    speaker=speaker,
-                ):
-                    yield chunk
-                    await asyncio.sleep(0)
+                for segment_req in stream_requests:
+                    for chunk in runtime.pipeline.stream_audio_chunks(
+                        req=segment_req,
+                        cancel_event=cancel_event,
+                        speaker=speaker,
+                    ):
+                        yield chunk
+                        await asyncio.sleep(0)
+                    if cancel_event.is_set():
+                        break
+                    if session_id:
+                        runtime.mark_session_segments_generated(session_id, 1)
             finally:
+                if session_id and close_after_stream:
+                    runtime.clear_buffered_session(session_id)
+                    runtime.pipeline.clear_continuation_session(session_id)
                 runtime.unregister_stream(stream_id)
 
-        media_type = "audio/wav" if req.response_format == "wav" else "audio/pcm"
+        media_type = "audio/wav" if response_format == "wav" else "audio/pcm"
         headers = {
             "X-Audio-Sample-Rate": str(runtime.config.sample_rate),
             "X-Audio-Channels": str(runtime.config.channels),
             "X-Audio-Bits-Per-Sample": str(runtime.config.bits_per_sample),
             "X-Model-Id": runtime.pipeline.active_model_id or req_model,
             "X-Custom-Speaker": speaker,
-            "X-Custom-Language": req.language or runtime.config.default_language,
+            "X-Custom-Language": req_language,
+            "X-Session-Id": session_id,
+            "X-Session-Segments": str(len(stream_requests)),
         }
         return StreamingResponse(iterator(), media_type=media_type, headers=headers)
 

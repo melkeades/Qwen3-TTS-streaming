@@ -973,7 +973,6 @@
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
       const speaker = (el.voice.value || "").trim();
       const sessionId = String(options.sessionId || "").trim();
-      const expectAudio = options.expectAudio !== false;
       const endOfMessage = options.endOfMessage !== false;
       const payload = {
         model: selectedModelId(),
@@ -1001,7 +1000,7 @@
 
       const headerAt = nowMs();
       state.stats.httpStatus = response.status;
-      if (expectAudio && !Number.isFinite(state.stats.ttfbHeadersMs)) {
+      if (response.status !== 202 && !Number.isFinite(state.stats.ttfbHeadersMs)) {
         state.stats.ttfbHeadersMs = headerAt - state.requestStartMs;
       }
 
@@ -1013,7 +1012,7 @@
         throw new Error(`${response.status} ${response.statusText} ${detail}`.trim());
       }
 
-      if (!expectAudio) {
+      if (response.status === 202) {
         let bufferedInfo = "";
         try {
           const ack = await response.json();
@@ -1211,8 +1210,7 @@
           const isFinalSegment = i === segments.length - 1;
           await streamOneSegment(segments[i], i, segments.length, {
             sessionId,
-            endOfMessage: useBackendBuffer ? isFinalSegment : true,
-            expectAudio: useBackendBuffer ? isFinalSegment : true
+            endOfMessage: useBackendBuffer ? isFinalSegment : true
           });
         }
 

@@ -42,6 +42,24 @@ class CustomBridgeConfig:
     optimize_compile_codebook_predictor: bool
     optimize_compile_talker: bool
     stream_use_optimized_decode: bool
+    continuation_default_frames: int
+    continuation_cache_ttl_sec: int
+    continuation_cache_max_entries: int
+    continuation_text_priming_enabled: bool
+    continuation_text_tail_chars: int
+    continuation_sampling_enabled: bool
+    continuation_sampling_temperature: float
+    continuation_sampling_top_k: int
+    continuation_sampling_subtalker_temperature: float
+    continuation_sampling_subtalker_top_k: int
+    continuation_followup_greedy_enabled: bool
+    continuation_alignment_tail_samples: int
+    continuation_alignment_search_samples: int
+    continuation_gain_match_enabled: bool
+    continuation_gain_match_buffer_ms: int
+    continuation_gain_match_min_gain: float
+    continuation_gain_match_max_gain: float
+    continuation_gain_match_tolerance: float
 
     warmup_enabled: bool
     warmup_runs: int
@@ -155,6 +173,63 @@ class CustomBridgeConfig:
             ),
             stream_use_optimized_decode=cls._env_bool(
                 "CUSTOM_BRIDGE_STREAM_USE_OPTIMIZED_DECODE", True
+            ),
+            continuation_default_frames=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_DEFAULT_FRAMES", "48")
+            ),
+            continuation_cache_ttl_sec=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_CACHE_TTL_SEC", "600")
+            ),
+            continuation_cache_max_entries=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_CACHE_MAX_ENTRIES", "256")
+            ),
+            continuation_text_priming_enabled=cls._env_bool(
+                "CUSTOM_BRIDGE_CONTINUATION_TEXT_PRIMING_ENABLED", True
+            ),
+            continuation_text_tail_chars=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_TEXT_TAIL_CHARS", "180")
+            ),
+            continuation_sampling_enabled=cls._env_bool(
+                "CUSTOM_BRIDGE_CONTINUATION_SAMPLING_ENABLED", True
+            ),
+            continuation_sampling_temperature=float(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_SAMPLING_TEMPERATURE", "0.55")
+            ),
+            continuation_sampling_top_k=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_SAMPLING_TOP_K", "24")
+            ),
+            continuation_sampling_subtalker_temperature=float(
+                os.getenv(
+                    "CUSTOM_BRIDGE_CONTINUATION_SAMPLING_SUBTALKER_TEMPERATURE",
+                    "0.45",
+                )
+            ),
+            continuation_sampling_subtalker_top_k=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_SAMPLING_SUBTALKER_TOP_K", "16")
+            ),
+            continuation_followup_greedy_enabled=cls._env_bool(
+                "CUSTOM_BRIDGE_CONTINUATION_FOLLOWUP_GREEDY_ENABLED", True
+            ),
+            continuation_alignment_tail_samples=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_ALIGNMENT_TAIL_SAMPLES", "4096")
+            ),
+            continuation_alignment_search_samples=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_ALIGNMENT_SEARCH_SAMPLES", "12000")
+            ),
+            continuation_gain_match_enabled=cls._env_bool(
+                "CUSTOM_BRIDGE_CONTINUATION_GAIN_MATCH_ENABLED", True
+            ),
+            continuation_gain_match_buffer_ms=int(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_GAIN_MATCH_BUFFER_MS", "320")
+            ),
+            continuation_gain_match_min_gain=float(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_GAIN_MATCH_MIN_GAIN", "0.25")
+            ),
+            continuation_gain_match_max_gain=float(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_GAIN_MATCH_MAX_GAIN", "1.35")
+            ),
+            continuation_gain_match_tolerance=float(
+                os.getenv("CUSTOM_BRIDGE_CONTINUATION_GAIN_MATCH_TOLERANCE", "0.08")
             ),
             warmup_enabled=cls._env_bool("CUSTOM_BRIDGE_WARMUP_ENABLED", True),
             warmup_runs=int(os.getenv("CUSTOM_BRIDGE_WARMUP_RUNS", "3")),

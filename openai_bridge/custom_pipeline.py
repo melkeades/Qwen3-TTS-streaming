@@ -1,10 +1,13 @@
 from __future__ import annotations
 
 import gc
+import hashlib
 import json
 import logging
 import os
+import re
 import struct
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Event, Lock
@@ -62,6 +65,50 @@ class _ModelCacheEntry:
     supported_speakers: set[str] | None
 
 
+@dataclass(frozen=True)
+class _ContinuationCacheKey:
+    model_id: str
+    speaker: str
+    language: str
+    continuation_id: str
+
+
+@dataclass
+class _ContinuationCacheEntry:
+    ref_code_context: torch.Tensor
+    updated_at: float
+    text_tail: str = ""
+    accumulated_text: str = ""
+    emitted_samples: int = 0
+    session_seed: int = 0
+    tail_audio: np.ndarray | None = None
+    voiced_rms: float = 0.0
+    head_rms: float = 0.0
+
+
+@dataclass
+class ContinuationState:
+    enabled: bool
+    key: _ContinuationCacheKey | None = None
+    requested_frames: int = 0
+    used: bool = False
+    used_frames: int = 0
+    ref_code_context: torch.Tensor | None = None
+    text_tail: str = ""
+    sampling_mode: str = "off"
+    sampling_seed: int | None = None
+    accumulated_text: str = ""
+    prior_emitted_samples: int = 0
+    prior_tail_audio: np.ndarray | None = None
+    prior_voiced_rms: float = 0.0
+    prior_head_rms: float = 0.0
+    total_generated_samples: int = 0
+    total_emitted_samples: int = 0
+    emitted_tail_audio: np.ndarray | None = None
+    emitted_voiced_rms: float = 0.0
+    emitted_head_rms: float = 0.0
+
+
 class QwenCustomStreamingPipeline:
     def __init__(self, config: CustomBridgeConfig):
         self.config = config
@@ -75,6 +122,8 @@ class QwenCustomStreamingPipeline:
         self._model_id_to_speakers: dict[str, list[str]] = {}
         self._model_lock = Lock()
         self._startup_ready = False
+        self._continuation_lock = Lock()
+        self._continuation_cache: dict[_ContinuationCacheKey, _ContinuationCacheEntry] = {}
 
     @property
     def loaded(self) -> bool:
@@ -281,6 +330,76 @@ class QwenCustomStreamingPipeline:
         self._model_id_to_speakers[model_id] = list(entry.speaker_names)
         self._startup_ready = True
 
+    def _build_continuation_key(
+        self,
+        *,
+        model_id: str,
+        speaker: str,
+        language: str,
+        continuation_id: str,
+    ) -> _ContinuationCacheKey:
+        return _ContinuationCacheKey(
+            model_id=(model_id or "").strip(),
+            speaker=(speaker or "").strip().lower(),
+            language=(language or "").strip().lower(),
+            continuation_id=(continuation_id or "").strip(),
+        )
+
+    def _purge_expired_continuations_unlocked(self, *, now: float | None = None) -> None:
+        ttl = max(0, int(self.config.continuation_cache_ttl_sec))
+        if ttl <= 0:
+            self._continuation_cache.clear()
+            return
+
+        ts = now if now is not None else time.time()
+        cutoff = ts - ttl
+        stale_keys = [
+            key
+            for key, entry in self._continuation_cache.items()
+            if entry.updated_at < cutoff
+        ]
+        for key in stale_keys:
+            self._continuation_cache.pop(key, None)
+
+    def _evict_overflow_continuations_unlocked(self) -> None:
+        max_entries = max(1, int(self.config.continuation_cache_max_entries))
+        overflow = len(self._continuation_cache) - max_entries
+        if overflow <= 0:
+            return
+
+        oldest = sorted(
+            self._continuation_cache.items(),
+            key=lambda item: item[1].updated_at,
+        )
+        for key, _entry in oldest[:overflow]:
+            self._continuation_cache.pop(key, None)
+
+    def _drop_continuations_for_model_unlocked(self, model_id: str) -> None:
+        target = (model_id or "").strip()
+        if not target:
+            return
+        keys_to_drop = [
+            key
+            for key in self._continuation_cache.keys()
+            if key.model_id == target
+        ]
+        for key in keys_to_drop:
+            self._continuation_cache.pop(key, None)
+
+    def clear_continuation_session(self, continuation_id: str) -> int:
+        target = (continuation_id or "").strip()
+        if not target:
+            return 0
+        with self._continuation_lock:
+            keys_to_drop = [
+                key
+                for key in self._continuation_cache.keys()
+                if key.continuation_id == target
+            ]
+            for key in keys_to_drop:
+                self._continuation_cache.pop(key, None)
+            return len(keys_to_drop)
+
     @staticmethod
     def _release_torch_memory_unlocked() -> None:
         gc.collect()
@@ -380,6 +499,8 @@ class QwenCustomStreamingPipeline:
             del model_obj
 
             self._model_id_to_speakers.pop(requested_model, None)
+            with self._continuation_lock:
+                self._drop_continuations_for_model_unlocked(requested_model)
             if was_active:
                 self.model = None
                 self._speaker_names = []
@@ -396,6 +517,8 @@ class QwenCustomStreamingPipeline:
             unloaded = len(self._model_cache)
             self._model_cache.clear()
             self._model_id_to_speakers.clear()
+            with self._continuation_lock:
+                self._continuation_cache.clear()
             self.model = None
             self._speaker_names = []
             self._supported_speakers = None
@@ -466,6 +589,351 @@ class QwenCustomStreamingPipeline:
         pcm_i16 = (clipped * 32767.0).astype(np.int16)
         return pcm_i16.tobytes(order="C")
 
+    def prepare_continuation_state(
+        self,
+        req: SpeechSynthesisParams,
+        *,
+        speaker: str,
+    ) -> ContinuationState:
+        mode = (req.continuation_mode or "off").strip().lower()
+        continuation_id = (req.continuation_id or "").strip()
+        if mode != "acoustic_tail" or not continuation_id:
+            return ContinuationState(enabled=False)
+
+        effective_model = (self._active_model_id or req.model or "").strip()
+        effective_language = (req.language or self.config.default_language).strip()
+        decode_window_frames = req.decode_window_frames or self.config.decode_window_frames
+
+        requested_frames = req.continuation_frames or self.config.continuation_default_frames
+        requested_frames = max(1, int(requested_frames))
+        if decode_window_frames > 0:
+            requested_frames = min(requested_frames, int(decode_window_frames))
+
+        key = self._build_continuation_key(
+            model_id=effective_model,
+            speaker=speaker,
+            language=effective_language,
+            continuation_id=continuation_id,
+        )
+
+        with self._continuation_lock:
+            now = time.time()
+            self._purge_expired_continuations_unlocked(now=now)
+            if req.continuation_reset:
+                self._continuation_cache.pop(key, None)
+
+            entry = self._continuation_cache.get(key)
+            if entry is not None and entry.ref_code_context.shape[0] > 0:
+                used_frames = min(requested_frames, int(entry.ref_code_context.shape[0]))
+                context = entry.ref_code_context[-used_frames:].detach().cpu().contiguous()
+                entry.updated_at = now
+                return ContinuationState(
+                    enabled=True,
+                    key=key,
+                    requested_frames=requested_frames,
+                    used=True,
+                    used_frames=used_frames,
+                    ref_code_context=context,
+                    text_tail=(entry.text_tail or ""),
+                    sampling_seed=int(entry.session_seed or self._build_continuation_seed(key=key)),
+                    accumulated_text=(entry.accumulated_text or ""),
+                    prior_emitted_samples=max(0, int(entry.emitted_samples or 0)),
+                    prior_tail_audio=(
+                        np.asarray(entry.tail_audio, dtype=np.float32).copy()
+                        if entry.tail_audio is not None and int(entry.tail_audio.size) > 0
+                        else None
+                    ),
+                    prior_voiced_rms=max(0.0, float(entry.voiced_rms or 0.0)),
+                    prior_head_rms=max(0.0, float(entry.head_rms or 0.0)),
+                )
+
+        return ContinuationState(
+            enabled=True,
+            key=key,
+            requested_frames=requested_frames,
+            used=False,
+            used_frames=0,
+            ref_code_context=None,
+            sampling_seed=self._build_continuation_seed(key=key),
+            accumulated_text="",
+            prior_emitted_samples=0,
+            prior_tail_audio=None,
+            prior_voiced_rms=0.0,
+            prior_head_rms=0.0,
+        )
+
+    def _store_continuation_from_model(self, state: ContinuationState) -> None:
+        if not state.enabled or state.key is None or self.model is None:
+            return
+
+        generated = self.model.get_last_stream_ref_code_context()
+        if generated is None or generated.shape[0] <= 0:
+            return
+
+        keep_frames = min(state.requested_frames, int(generated.shape[0]))
+        if keep_frames <= 0:
+            return
+        stored_context = generated[-keep_frames:].detach().cpu().contiguous()
+
+        with self._continuation_lock:
+            now = time.time()
+            self._purge_expired_continuations_unlocked(now=now)
+            self._continuation_cache[state.key] = _ContinuationCacheEntry(
+                ref_code_context=stored_context,
+                updated_at=now,
+                text_tail=state.text_tail,
+                accumulated_text=state.accumulated_text,
+                emitted_samples=max(0, int(state.total_emitted_samples)),
+                session_seed=int(state.sampling_seed or 0),
+                tail_audio=(
+                    np.asarray(state.emitted_tail_audio, dtype=np.float32).copy()
+                    if state.emitted_tail_audio is not None and int(state.emitted_tail_audio.size) > 0
+                    else None
+                ),
+                voiced_rms=max(0.0, float(state.emitted_voiced_rms or 0.0)),
+                head_rms=max(0.0, float(state.emitted_head_rms or 0.0)),
+            )
+            self._evict_overflow_continuations_unlocked()
+
+    def _extract_text_tail(self, text: str) -> str:
+        raw = (text or "").strip()
+        if not raw:
+            return ""
+        tail_chars = max(1, int(self.config.continuation_text_tail_chars))
+        sentences = re.findall(r"[^.!?]+[.!?]+|[^.!?]+$", raw, flags=re.MULTILINE)
+        tail = sentences[-1].strip() if sentences else raw
+        if len(tail) > tail_chars:
+            tail = tail[-tail_chars:].lstrip()
+        return tail
+
+    @staticmethod
+    def _continuation_seed_from_parts(*parts: bytes) -> int:
+        digest = hashlib.blake2b(digest_size=8)
+        for part in parts:
+            digest.update(part)
+        return int.from_bytes(digest.digest(), byteorder="big", signed=False) & 0x7FFFFFFF
+
+    def _build_continuation_seed(self, *, key: _ContinuationCacheKey) -> int:
+        key_bytes = "|".join(
+            [
+                "continuation-seed-v2",
+                key.model_id,
+                key.speaker,
+                key.language,
+            ]
+        ).encode("utf-8", errors="ignore")
+        return self._continuation_seed_from_parts(key_bytes)
+
+    @staticmethod
+    def _seed_sampling(seed: int | None) -> None:
+        if seed is None:
+            return
+        torch.manual_seed(int(seed))
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(int(seed))
+
+    @staticmethod
+    def _combine_continuation_text(prefix: str, current: str) -> str:
+        prev = (prefix or "").strip()
+        cur = (current or "").strip()
+        if not prev:
+            return cur
+        if not cur:
+            return prev
+        return f"{prev} {cur}"
+
+    def _continuation_tail_keep_samples(self) -> int:
+        return max(256, int(self.config.continuation_alignment_tail_samples))
+
+    @staticmethod
+    def _update_tail_audio(
+        existing: np.ndarray | None,
+        chunk: np.ndarray,
+        *,
+        keep_samples: int,
+    ) -> np.ndarray | None:
+        audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+        if audio.size <= 0 or keep_samples <= 0:
+            return existing
+        if audio.size >= keep_samples:
+            return audio[-keep_samples:].copy()
+        if existing is None or int(existing.size) <= 0:
+            return audio.copy()
+        merged = np.concatenate([np.asarray(existing, dtype=np.float32).reshape(-1), audio])
+        if merged.size > keep_samples:
+            merged = merged[-keep_samples:]
+        return merged.copy()
+
+    @staticmethod
+    def _normalized_correlation(a: np.ndarray, b: np.ndarray) -> float:
+        left = np.asarray(a, dtype=np.float32).reshape(-1)
+        right = np.asarray(b, dtype=np.float32).reshape(-1)
+        if left.size <= 0 or right.size <= 0 or left.size != right.size:
+            return -1.0
+        left = left - float(left.mean())
+        right = right - float(right.mean())
+        denom = float(np.linalg.norm(left) * np.linalg.norm(right))
+        if denom <= 1e-8:
+            return -1.0
+        return float(np.dot(left, right) / denom)
+
+    def _find_continuation_cut(
+        self,
+        *,
+        audio: np.ndarray,
+        expected_samples: int,
+        prior_tail_audio: np.ndarray | None,
+    ) -> int:
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if samples.size <= 0:
+            return 0
+
+        expected = int(np.clip(expected_samples, 0, samples.size))
+        if prior_tail_audio is None:
+            return expected
+
+        tail = np.asarray(prior_tail_audio, dtype=np.float32).reshape(-1)
+        if tail.size < 128:
+            return expected
+
+        tail_len = min(int(tail.size), self._continuation_tail_keep_samples(), int(samples.size))
+        if tail_len < 128:
+            return expected
+        tail = tail[-tail_len:]
+
+        configured_radius = max(128, int(self.config.continuation_alignment_search_samples))
+        dynamic_radius = max(256, tail_len // 2, expected // 8)
+        search_radius = min(configured_radius, dynamic_radius)
+        min_end = tail_len
+        max_end = int(samples.size)
+        start_end = max(min_end, expected - search_radius)
+        stop_end = min(max_end, expected + search_radius)
+        if stop_end <= start_end:
+            return expected
+
+        coarse_step = 64 if (stop_end - start_end) > 512 else 8
+        candidate_ends = list(range(start_end, stop_end + 1, coarse_step))
+        if expected >= start_end and expected <= stop_end and expected not in candidate_ends:
+            candidate_ends.append(expected)
+
+        distance_penalty = 0.03
+        candidate_scores: list[tuple[int, float, float]] = []
+        for end in candidate_ends:
+            segment = samples[end - tail_len : end]
+            score = self._normalized_correlation(segment, tail)
+            weighted = score - (
+                distance_penalty * (abs(end - expected) / max(1.0, float(tail_len)))
+            )
+            candidate_scores.append((end, score, weighted))
+
+        if not candidate_scores:
+            return expected
+
+        best_score = max(score for _, score, _weighted in candidate_scores)
+        if best_score < 0.35:
+            return expected
+
+        anchor_end = max(
+            candidate_scores,
+            key=lambda item: (item[2], item[1]),
+        )[0]
+
+        refine_start = max(min_end, anchor_end - coarse_step)
+        refine_stop = min(max_end, anchor_end + coarse_step)
+        refined_scores: list[tuple[int, float, float]] = []
+        for end in range(refine_start, refine_stop + 1):
+            segment = samples[end - tail_len : end]
+            score = self._normalized_correlation(segment, tail)
+            weighted = score - (
+                distance_penalty * (abs(end - expected) / max(1.0, float(tail_len)))
+            )
+            refined_scores.append((end, score, weighted))
+
+        best_end = max(
+            refined_scores,
+            key=lambda item: (item[2], item[1]),
+        )[0]
+        return int(np.clip(best_end, 0, samples.size))
+
+    def _trim_leading_continuation_silence(self, audio: np.ndarray) -> tuple[np.ndarray, int]:
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        if samples.size <= 0:
+            return samples, 0
+
+        max_trim = min(int(samples.size), max(128, int(self.config.sample_rate // 8)))
+        if max_trim < 64:
+            return samples, 0
+
+        peak = float(np.max(np.abs(samples)))
+        if peak <= 8e-4:
+            return samples, 0
+
+        threshold = max(peak * 0.02, 8e-4)
+        block = 64
+        trim = 0
+        while trim + block <= max_trim:
+            if float(np.max(np.abs(samples[trim : trim + block]))) >= threshold:
+                break
+            trim += block
+        while trim < max_trim and float(abs(samples[trim])) < threshold:
+            trim += 1
+        if trim < block:
+            return samples, 0
+        return samples[trim:], trim
+
+    @staticmethod
+    def _voiced_mask(audio: np.ndarray, *, threshold: float = 0.01) -> np.ndarray:
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        return np.abs(samples) >= threshold
+
+    @classmethod
+    def _voiced_rms(cls, audio: np.ndarray, *, threshold: float = 0.01) -> float:
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        mask = cls._voiced_mask(samples, threshold=threshold)
+        if not np.any(mask):
+            return 0.0
+        voiced = samples[mask]
+        return float(np.sqrt(np.mean(voiced * voiced)))
+
+    @classmethod
+    def _leading_voiced_rms(
+        cls,
+        audio: np.ndarray,
+        *,
+        window_samples: int,
+        threshold: float = 0.01,
+    ) -> float:
+        samples = np.asarray(audio, dtype=np.float32).reshape(-1)
+        mask = cls._voiced_mask(samples, threshold=threshold)
+        idx = np.flatnonzero(mask)
+        if idx.size <= 0:
+            return 0.0
+        start = int(idx[0])
+        stop = min(int(samples.size), start + max(256, int(window_samples)))
+        segment = samples[start:stop]
+        if segment.size <= 0:
+            return 0.0
+        return cls._voiced_rms(segment, threshold=threshold)
+
+    @staticmethod
+    def _apply_gain(audio: np.ndarray, gain: float) -> np.ndarray:
+        if abs(float(gain) - 1.0) <= 1e-6:
+            return np.asarray(audio, dtype=np.float32).reshape(-1)
+        return np.clip(
+            np.asarray(audio, dtype=np.float32).reshape(-1) * float(gain),
+            -1.0,
+            1.0,
+        )
+
+    @staticmethod
+    def _segment_word_count(text: str) -> int:
+        return len(re.findall(r"[A-Za-z0-9']+", text or ""))
+
+    def _max_reasonable_segment_samples(self, text: str) -> int:
+        words = max(1, self._segment_word_count(text))
+        max_seconds = min(20.0, max(5.0, 3.5 + float(words)))
+        return int(max_seconds * float(self.config.sample_rate))
+
     def has_speaker(self, speaker: str) -> bool:
         if not speaker:
             return False
@@ -482,6 +950,7 @@ class QwenCustomStreamingPipeline:
         cancel_event: Event,
         *,
         speaker: str,
+        continuation_state: ContinuationState | None = None,
     ) -> Iterator[bytes]:
         if self.model is None:
             raise RuntimeError("Pipeline not loaded")
@@ -503,6 +972,59 @@ class QwenCustomStreamingPipeline:
             if req.use_optimized_decode is not None
             else self.config.stream_use_optimized_decode
         )
+        state = continuation_state or self.prepare_continuation_state(
+            req=req,
+            speaker=speaker,
+        )
+        gen_kwargs: dict[str, object] = {}
+        text_to_synthesize = req.input
+        tail_keep_samples = self._continuation_tail_keep_samples()
+        emitted_tail_audio: np.ndarray | None = None
+        state.total_generated_samples = 0
+        state.total_emitted_samples = 0
+        state.emitted_tail_audio = None
+        state.emitted_voiced_rms = 0.0
+        state.emitted_head_rms = 0.0
+        if state.enabled:
+            state.accumulated_text = self._combine_continuation_text(
+                state.accumulated_text,
+                req.input,
+            )
+        if (
+            state.enabled
+            and state.used
+            and bool(self.config.continuation_text_priming_enabled)
+            and state.text_tail
+        ):
+            style_bridge = (
+                "Continue in the same speaking style, speed, tone, and prosody "
+                "as the immediately previous segment."
+            )
+            context_line = f"Previous segment tail context: {state.text_tail}"
+            pieces = [p for p in [instruct, style_bridge, context_line] if p]
+            instruct = "\n".join(pieces)
+        state.text_tail = self._extract_text_tail(req.input)
+        if state.enabled and bool(self.config.continuation_sampling_enabled):
+            if state.used and bool(self.config.continuation_followup_greedy_enabled):
+                gen_kwargs.update(
+                    do_sample=False,
+                    subtalker_dosample=False,
+                    temperature=0.0,
+                    top_k=1,
+                    subtalker_temperature=0.0,
+                    subtalker_top_k=1,
+                )
+                state.sampling_mode = "greedy_followup"
+            else:
+                gen_kwargs.update(
+                    temperature=float(self.config.continuation_sampling_temperature),
+                    top_k=int(self.config.continuation_sampling_top_k),
+                    subtalker_temperature=float(
+                        self.config.continuation_sampling_subtalker_temperature
+                    ),
+                    subtalker_top_k=int(self.config.continuation_sampling_subtalker_top_k),
+                )
+                state.sampling_mode = "seeded_clamped"
 
         if req.response_format == "wav":
             yield wav_header(
@@ -510,22 +1032,136 @@ class QwenCustomStreamingPipeline:
                 bits_per_sample=self.config.bits_per_sample,
                 channels=self.config.channels,
             )
+        generation_completed = False
+        try:
+            if state.enabled and bool(self.config.continuation_sampling_enabled):
+                self._seed_sampling(state.sampling_seed)
+            emitted_samples = 0
+            max_segment_samples = self._max_reasonable_segment_samples(text_to_synthesize)
+            voiced_sum_sq = 0.0
+            voiced_count = 0
+            emitted_head_buffer = np.zeros((0,), dtype=np.float32)
+            gain = 1.0
+            gain_ready = not (
+                state.enabled
+                and state.used
+                and bool(self.config.continuation_gain_match_enabled)
+                and state.prior_voiced_rms > 0.0
+            )
+            pending_gain_chunks: list[np.ndarray] = []
+            pending_gain_samples = 0
+            gain_buffer_samples = max(
+                512,
+                int(self.config.sample_rate * max(40, self.config.continuation_gain_match_buffer_ms) / 1000.0),
+            )
+            head_window_samples = max(512, int(self.config.sample_rate * 0.22))
 
-        for chunk, _sr in self.model.stream_generate_custom_voice(
-            text=req.input,
-            language=language,
-            speaker=speaker,
-            instruct=instruct,
-            emit_every_frames=emit_every_frames,
-            decode_window_frames=decode_window_frames,
-            overlap_samples=overlap_samples,
-            max_frames=max_frames,
-            use_optimized_decode=use_optimized_decode,
-        ):
-            if cancel_event.is_set():
-                return
-            if chunk is None:
-                continue
-            pcm = self._float_audio_to_pcm16_bytes(chunk)
-            if pcm:
-                yield pcm
+            def emit_scaled(audio_chunk: np.ndarray) -> bytes:
+                nonlocal emitted_samples, emitted_tail_audio, voiced_sum_sq, voiced_count, emitted_head_buffer
+                scaled = self._apply_gain(audio_chunk, gain)
+                emitted_samples += int(scaled.size)
+                emitted_tail_audio = self._update_tail_audio(
+                    emitted_tail_audio,
+                    scaled,
+                    keep_samples=tail_keep_samples,
+                )
+                if emitted_head_buffer.size < head_window_samples:
+                    keep = max(0, head_window_samples - int(emitted_head_buffer.size))
+                    emitted_head_buffer = np.concatenate(
+                        [emitted_head_buffer, scaled[:keep]],
+                        axis=0,
+                    )
+                voiced = scaled[self._voiced_mask(scaled)]
+                if voiced.size > 0:
+                    voiced_sum_sq += float(np.dot(voiced, voiced))
+                    voiced_count += int(voiced.size)
+                return self._float_audio_to_pcm16_bytes(scaled)
+
+            def resolve_gain_from_pending(force: bool = False) -> bytes:
+                nonlocal gain, gain_ready, pending_gain_chunks, pending_gain_samples
+                if not pending_gain_chunks:
+                    return b""
+                buffered = np.concatenate(pending_gain_chunks, axis=0).astype(np.float32, copy=False)
+                enough = pending_gain_samples >= gain_buffer_samples
+                head_rms = self._leading_voiced_rms(
+                    buffered,
+                    window_samples=head_window_samples,
+                )
+                if not gain_ready and (force or enough or head_rms > 0.0):
+                    if head_rms > 0.0 and state.prior_voiced_rms > 0.0:
+                        target_rms = max(
+                            float(state.prior_voiced_rms),
+                            float(state.prior_head_rms) * 0.85,
+                        )
+                        raw_gain = float(target_rms) / float(head_rms)
+                        gain = float(
+                            np.clip(
+                                raw_gain,
+                                float(self.config.continuation_gain_match_min_gain),
+                                float(self.config.continuation_gain_match_max_gain),
+                            )
+                        )
+                        if abs(gain - 1.0) <= float(self.config.continuation_gain_match_tolerance):
+                            gain = 1.0
+                    gain_ready = True
+                if not gain_ready:
+                    return b""
+                pending_gain_chunks = []
+                pending_gain_samples = 0
+                return emit_scaled(buffered)
+
+            for chunk, _sr in self.model.stream_generate_custom_voice(
+                text=text_to_synthesize,
+                language=language,
+                speaker=speaker,
+                instruct=instruct,
+                emit_every_frames=emit_every_frames,
+                decode_window_frames=decode_window_frames,
+                overlap_samples=overlap_samples,
+                max_frames=max_frames,
+                use_optimized_decode=use_optimized_decode,
+                external_ref_code_context=state.ref_code_context if state.enabled else None,
+                capture_ref_code_context_frames=state.requested_frames if state.enabled else 0,
+                **gen_kwargs,
+            ):
+                if cancel_event.is_set():
+                    return
+                if chunk is None:
+                    continue
+                chunk_audio = np.asarray(chunk, dtype=np.float32).reshape(-1)
+                state.total_generated_samples += int(chunk_audio.size)
+                if not gain_ready:
+                    pending_gain_chunks.append(chunk_audio.copy())
+                    pending_gain_samples += int(chunk_audio.size)
+                    pcm = resolve_gain_from_pending(force=False)
+                else:
+                    pcm = emit_scaled(chunk_audio)
+                if pcm:
+                    yield pcm
+                if emitted_samples >= max_segment_samples:
+                    logger.warning(
+                        "Stopping oversized segment early speaker=%s words=%s emitted_samples=%s limit=%s text=%r",
+                        speaker,
+                        self._segment_word_count(text_to_synthesize),
+                        emitted_samples,
+                        max_segment_samples,
+                        text_to_synthesize[:160],
+                    )
+                    break
+            if pending_gain_chunks:
+                pcm = resolve_gain_from_pending(force=True)
+                if pcm:
+                    yield pcm
+            state.total_emitted_samples = emitted_samples
+            state.emitted_tail_audio = emitted_tail_audio
+            if voiced_count > 0:
+                state.emitted_voiced_rms = float(np.sqrt(voiced_sum_sq / float(voiced_count)))
+            if emitted_head_buffer.size > 0:
+                state.emitted_head_rms = self._leading_voiced_rms(
+                    emitted_head_buffer,
+                    window_samples=head_window_samples,
+                )
+            generation_completed = True
+        finally:
+            if generation_completed:
+                self._store_continuation_from_model(state)

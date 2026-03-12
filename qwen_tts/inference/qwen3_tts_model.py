@@ -71,6 +71,7 @@ class Qwen3TTSModel:
         self.model = model
         self.processor = processor
         self.generate_defaults = generate_defaults or {}
+        self._last_stream_generated_ref_code_context: Optional[torch.Tensor] = None
 
         self.device = getattr(model, "device", None)
         if self.device is None:
@@ -1029,6 +1030,8 @@ class Qwen3TTSModel:
         max_frames: int = 10000,
         # Optimization
         use_optimized_decode: bool = True,
+        external_ref_code_context: Optional[torch.Tensor] = None,
+        capture_ref_code_context_frames: int = 0,
         **kwargs,
     ) -> Generator[Tuple[np.ndarray, int], None, None]:
         """
@@ -1087,6 +1090,7 @@ class Qwen3TTSModel:
             "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
         }
         gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+        self._last_stream_generated_ref_code_context = None
 
         for chunk, sr in self.model.stream_generate_pcm(
             input_ids=input_ids,
@@ -1099,9 +1103,27 @@ class Qwen3TTSModel:
             overlap_samples=overlap_samples,
             max_frames=max_frames,
             use_optimized_decode=use_optimized_decode,
+            external_ref_code_context=external_ref_code_context,
+            capture_ref_code_context_frames=capture_ref_code_context_frames,
             **gen_kwargs,
         ):
             yield chunk, sr
+
+        stream_ctx = getattr(self.model, "_last_stream_generated_ref_code_context", None)
+        self._last_stream_generated_ref_code_context = (
+            stream_ctx.detach().cpu().contiguous()
+            if isinstance(stream_ctx, torch.Tensor)
+            else None
+        )
+
+    def get_last_stream_ref_code_context(self) -> Optional[torch.Tensor]:
+        live_ctx = getattr(self.model, "_last_stream_generated_ref_code_context", None)
+        if isinstance(live_ctx, torch.Tensor):
+            return live_ctx.detach().cpu().contiguous()
+        stream_ctx = self._last_stream_generated_ref_code_context
+        if isinstance(stream_ctx, torch.Tensor):
+            return stream_ctx.detach().cpu().contiguous()
+        return None
 
 
     def get_supported_speakers(self) -> Optional[List[str]]:
