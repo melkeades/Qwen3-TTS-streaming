@@ -1,6 +1,0 @@
-[GET] http://127.0.0.1:8040/v1/models => [200] OK
-[GET] http://127.0.0.1:8040/healthz => [200] OK
-[GET] http://127.0.0.1:8040/v1/speakers?model=output%2Ftest => [200] OK
-[GET] http://127.0.0.1:8040/v1/models => [200] OK
-[GET] http://127.0.0.1:8040/healthz => [200] OK
-[GET] http://127.0.0.1:8040/v1/speakers?model=output%2Ftest => [200] OK
