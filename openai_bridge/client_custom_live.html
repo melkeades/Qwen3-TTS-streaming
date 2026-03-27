@@ -291,7 +291,7 @@
           </div>
           <div>
             <label for="sessionId">Session ID (bridge-only)</label>
-            <input id="sessionId" placeholder="auto-generated when backend buffer is enabled" />
+            <input id="sessionId" placeholder="auto-generated when backend live session is enabled" />
           </div>
         </div>
 
@@ -302,7 +302,7 @@
 
         <div class="inline-toggle">
           <input id="backendBuffer" type="checkbox" checked />
-          <label for="backendBuffer" style="margin: 0;">Use backend text buffering with one `session_id` across chunks (bridge extension, not official OpenAI `/v1/audio/speech`).</label>
+          <label for="backendBuffer" style="margin: 0;">Use backend live session across chunks (opens `WS /v1/audio/speech/live` and appends text into one server-owned Qwen session).</label>
         </div>
 
         <div style="margin-top: 12px;">
@@ -317,6 +317,7 @@
           <button id="unloadBtn" class="secondary" type="button">Unload Model</button>
           <button id="unloadAllBtn" class="secondary" type="button">Unload All</button>
           <button id="stopBtn" class="warn" type="button" disabled>Stop</button>
+          <button id="downloadBtn" class="secondary" type="button" disabled>Download Last Generation</button>
         </div>
       </form>
 
@@ -373,6 +374,7 @@
       unloadBtn: document.getElementById("unloadBtn"),
       unloadAllBtn: document.getElementById("unloadAllBtn"),
       stopBtn: document.getElementById("stopBtn"),
+      downloadBtn: document.getElementById("downloadBtn"),
       status: document.getElementById("status"),
       log: document.getElementById("log"),
       sHttp: document.getElementById("sHttp"),
@@ -406,7 +408,12 @@
       pcmRemainder: new Uint8Array(0),
       wavHeaderBuffer: new Uint8Array(0),
       wavHeaderDone: false,
-      activeSessionId: null
+      activeSessionId: null,
+      activeSessionTransport: null,
+      liveSocket: null,
+      currentRunPcmChunks: [],
+      currentRunPcmBytes: 0,
+      lastGeneration: null
     };
 
     function nowMs() {
@@ -455,6 +462,108 @@
 
     function clearLog() {
       el.log.textContent = "";
+    }
+
+    function setDownloadButtonState() {
+      el.downloadBtn.disabled = !state.lastGeneration;
+    }
+
+    function resetRunAudioCapture() {
+      state.currentRunPcmChunks = [];
+      state.currentRunPcmBytes = 0;
+    }
+
+    function captureRunPcm(bytes) {
+      if (!(bytes instanceof Uint8Array) || bytes.byteLength === 0) {
+        return;
+      }
+      state.currentRunPcmChunks.push(new Uint8Array(bytes));
+      state.currentRunPcmBytes += bytes.byteLength;
+    }
+
+    function concatUint8(chunks, totalBytes) {
+      const out = new Uint8Array(Math.max(0, totalBytes || 0));
+      let offset = 0;
+      for (const chunk of chunks) {
+        out.set(chunk, offset);
+        offset += chunk.byteLength;
+      }
+      return out;
+    }
+
+    function buildWavFromPcm(pcmBytes, sampleRate, channels, bitsPerSample) {
+      const dataSize = pcmBytes.byteLength;
+      const byteRate = sampleRate * channels * (bitsPerSample / 8);
+      const blockAlign = channels * (bitsPerSample / 8);
+      const header = new ArrayBuffer(44);
+      const view = new DataView(header);
+      const writeAscii = (offset, text) => {
+        for (let i = 0; i < text.length; i++) {
+          view.setUint8(offset + i, text.charCodeAt(i));
+        }
+      };
+
+      writeAscii(0, "RIFF");
+      view.setUint32(4, 36 + dataSize, true);
+      writeAscii(8, "WAVE");
+      writeAscii(12, "fmt ");
+      view.setUint32(16, 16, true);
+      view.setUint16(20, 1, true);
+      view.setUint16(22, channels, true);
+      view.setUint32(24, sampleRate, true);
+      view.setUint32(28, byteRate, true);
+      view.setUint16(32, blockAlign, true);
+      view.setUint16(34, bitsPerSample, true);
+      writeAscii(36, "data");
+      view.setUint32(40, dataSize, true);
+
+      const out = new Uint8Array(44 + dataSize);
+      out.set(new Uint8Array(header), 0);
+      out.set(pcmBytes, 44);
+      return out;
+    }
+
+    function saveLastGenerationFromCurrentRun() {
+      if (state.currentRunPcmBytes <= 0) {
+        return false;
+      }
+      const pcmBytes = concatUint8(state.currentRunPcmChunks, state.currentRunPcmBytes);
+      const wavBytes = buildWavFromPcm(
+        pcmBytes,
+        state.sampleRate || DEFAULT_SAMPLE_RATE,
+        state.channels || DEFAULT_CHANNELS,
+        state.bitsPerSample || DEFAULT_BITS
+      );
+      state.lastGeneration = {
+        bytes: wavBytes,
+        mimeType: "audio/wav",
+        extension: "wav",
+        createdAt: Date.now()
+      };
+      setDownloadButtonState();
+      return true;
+    }
+
+    function downloadLastGeneration() {
+      const last = state.lastGeneration;
+      if (!last || !(last.bytes instanceof Uint8Array) || last.bytes.byteLength <= 0) {
+        setStatus("No completed generation available to download.", "warn-text");
+        return;
+      }
+      const iso = new Date(last.createdAt || Date.now())
+        .toISOString()
+        .replace(/[:.]/g, "-");
+      const fileName = `qwen_last_generation_${iso}.${last.extension || "wav"}`;
+      const blob = new Blob([last.bytes], { type: last.mimeType || "application/octet-stream" });
+      const url = URL.createObjectURL(blob);
+      const a = document.createElement("a");
+      a.href = url;
+      a.download = fileName;
+      document.body.appendChild(a);
+      a.click();
+      a.remove();
+      setTimeout(() => URL.revokeObjectURL(url), 1000);
+      appendLog(`downloaded ${fileName}`);
     }
 
     function setIdleActionState(disabled) {
@@ -969,6 +1078,25 @@
       }
     }
 
+    function buildLiveWsUrl(baseUrl) {
+      const url = new URL(baseUrl);
+      url.protocol = url.protocol === "https:" ? "wss:" : "ws:";
+      const normalizedPath = url.pathname.replace(/\/$/, "");
+      url.pathname = `${normalizedPath}/v1/audio/speech/live`;
+      url.search = "";
+      url.hash = "";
+      return url.toString();
+    }
+
+    function base64ToBytes(encoded) {
+      const binary = atob(String(encoded || ""));
+      const out = new Uint8Array(binary.length);
+      for (let i = 0; i < binary.length; i++) {
+        out[i] = binary.charCodeAt(i);
+      }
+      return out;
+    }
+
     async function streamOneSegment(segmentText, segmentIndex, segmentCount, options = {}) {
       const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
       const speaker = (el.voice.value || "").trim();
@@ -1070,6 +1198,7 @@
 
         if (payloadBytes.byteLength > 0) {
           state.stats.bytes += payloadBytes.byteLength;
+          captureRunPcm(payloadBytes);
           const float32 = pcmBytesToFloat32(payloadBytes);
           if (float32.length > 0) {
             queueFloat32(float32, state.sampleRate);
@@ -1081,6 +1210,158 @@
       }
 
       appendLog(`segment ${segmentIndex + 1}/${segmentCount} completed`);
+    }
+
+    async function streamLiveSession(segments) {
+      const baseUrl = el.baseUrl.value.trim().replace(/\/$/, "");
+      const speaker = (el.voice.value || "").trim();
+      const sessionId = resolveSessionId();
+      const wsUrl = buildLiveWsUrl(baseUrl);
+      const modelId = selectedModelId();
+
+      state.activeSessionId = sessionId;
+      state.activeSessionTransport = "ws-live";
+      resetStreamDecoders();
+
+      return await new Promise((resolve, reject) => {
+        let settled = false;
+        const ws = new WebSocket(wsUrl);
+        state.liveSocket = ws;
+
+        const finishOk = () => {
+          if (settled) return;
+          settled = true;
+          state.liveSocket = null;
+          resolve();
+        };
+
+        const finishError = (error) => {
+          if (settled) return;
+          settled = true;
+          state.liveSocket = null;
+          reject(error instanceof Error ? error : new Error(String(error || "live websocket failed")));
+        };
+
+        const send = (payload) => {
+          if (ws.readyState !== WebSocket.OPEN) {
+            throw new Error("Live websocket is not open.");
+          }
+          ws.send(JSON.stringify(payload));
+        };
+
+        ws.addEventListener("open", () => {
+          state.stats.httpStatus = 101;
+          send({
+            type: "session.start",
+            session_id: sessionId,
+            model: modelId,
+            voice: speaker,
+            speaker,
+            language: el.language.value.trim() || "English",
+            instructions: el.instruct.value.trim(),
+            response_format: el.responseFormat.value,
+            speed: Number.parseFloat(el.speed.value || "1") || 1.0
+          });
+        });
+
+        ws.addEventListener("message", (event) => {
+          let message;
+          try {
+            message = JSON.parse(event.data);
+          } catch (error) {
+            finishError(new Error(`Invalid live websocket payload: ${error.message}`));
+            return;
+          }
+
+          if (message.type === "session.ready") {
+            if (!Number.isFinite(state.stats.ttfbHeadersMs)) {
+              state.stats.ttfbHeadersMs = nowMs() - state.requestStartMs;
+            }
+            appendLog(`live session ready: ${sessionId}`);
+            setStatus("Live session connected. Streaming...");
+            try {
+              for (let i = 0; i < segments.length; i++) {
+                appendLog(`live append ${i + 1}/${segments.length} (${segments[i].length} chars)`);
+                send({
+                  type: "text.append",
+                  session_id: sessionId,
+                  text: segments[i]
+                });
+              }
+              send({
+                type: "session.finish",
+                session_id: sessionId
+              });
+            } catch (error) {
+              finishError(error);
+            }
+            return;
+          }
+
+          if (message.type === "audio.delta") {
+            if (!Number.isFinite(state.stats.ttfbChunkMs)) {
+              state.stats.ttfbChunkMs = nowMs() - state.requestStartMs;
+            }
+
+            const msgSampleRate = Number.parseInt(message.sample_rate || "0", 10);
+            const msgChannels = Number.parseInt(message.channels || "0", 10);
+            const msgBits = Number.parseInt(message.bits_per_sample || "0", 10);
+            if (msgSampleRate > 0) state.sampleRate = msgSampleRate;
+            if (msgChannels > 0) state.channels = msgChannels;
+            if (msgBits > 0) state.bitsPerSample = msgBits;
+            state.bytesPerSecond = state.sampleRate * state.channels * (state.bitsPerSample / 8);
+
+            state.stats.chunks += 1;
+            let payloadBytes = base64ToBytes(message.data || "");
+            if (el.responseFormat.value === "wav") {
+              payloadBytes = ingestWavBytes(payloadBytes);
+            }
+            if (payloadBytes.byteLength > 0) {
+              state.stats.bytes += payloadBytes.byteLength;
+              captureRunPcm(payloadBytes);
+              const float32 = pcmBytesToFloat32(payloadBytes);
+              if (float32.length > 0) {
+                queueFloat32(float32, state.sampleRate);
+              }
+            }
+            updateDerivedStats();
+            updateStats();
+            return;
+          }
+
+          if (message.type === "session.draining") {
+            appendLog("live session draining");
+            setStatus("Live session draining...");
+            return;
+          }
+
+          if (message.type === "session.done") {
+            appendLog(`live session completed${message.cancelled ? " (cancelled)" : ""}`);
+            try { ws.close(); } catch (_) {}
+            finishOk();
+            return;
+          }
+
+          if (message.type === "error") {
+            finishError(new Error(message.message || "live websocket error"));
+          }
+        });
+
+        ws.addEventListener("error", () => {
+          finishError(new Error("Live websocket transport error."));
+        });
+
+        ws.addEventListener("close", (event) => {
+          state.liveSocket = null;
+          if (!settled) {
+            if (state.stopRequested) {
+              finishOk();
+            } else {
+              finishError(new Error(`Live websocket closed (${event.code}).`));
+            }
+          }
+        });
+      });
     }
 
     async function runWarmup() {
@@ -1174,6 +1455,7 @@
       state.stats = newStats();
       state.requestStartMs = nowMs();
       state.firstAudioScheduled = false;
+      resetRunAudioCapture();
 
       clearLog();
       updateStats();
@@ -1196,25 +1478,31 @@
 
         const sessionId = useBackendBuffer ? resolveSessionId() : "";
         state.activeSessionId = sessionId || null;
+        state.activeSessionTransport = useBackendBuffer ? "ws-live" : null;
 
-        appendLog(`stream mode: ${el.responseFormat.value}, segmented: ${segmentedMode}, backend_buffer: ${useBackendBuffer}`);
+        appendLog(`stream mode: ${el.responseFormat.value}, segmented: ${segmentedMode}, backend_live: ${useBackendBuffer}`);
         appendLog(`segments: ${segments.length}`);
         if (sessionId) {
           appendLog(`session id: ${sessionId}`);
         }
 
-        for (let i = 0; i < segments.length; i++) {
-          if (state.abortController.signal.aborted) {
-            throw new DOMException("Aborted", "AbortError");
+        if (useBackendBuffer) {
+          await streamLiveSession(segments);
+        } else {
+          for (let i = 0; i < segments.length; i++) {
+            if (state.abortController.signal.aborted) {
+              throw new DOMException("Aborted", "AbortError");
+            }
+            const isFinalSegment = i === segments.length - 1;
+            await streamOneSegment(segments[i], i, segments.length, {
+              sessionId,
+              endOfMessage: true
+            });
           }
-          const isFinalSegment = i === segments.length - 1;
-          await streamOneSegment(segments[i], i, segments.length, {
-            sessionId,
-            endOfMessage: useBackendBuffer ? isFinalSegment : true
-          });
         }
 
         completed = true;
+        saveLastGenerationFromCurrentRun();
         state.activeSessionId = null;
         updateDerivedStats();
         updateStats();
@@ -1230,10 +1518,12 @@
         }
       } finally {
         state.abortController = null;
-        if (!completed && state.activeSessionId) {
+        if (!completed && state.activeSessionId && state.activeSessionTransport === "http-buffer") {
           await clearBufferedSession(state.activeSessionId, true);
         }
         state.activeSessionId = null;
+        state.activeSessionTransport = null;
+        state.liveSocket = null;
         const hadQueuedAudio = await waitForPlaybackDrain();
         if (completed && hadQueuedAudio && !state.stopRequested) {
           setStatus("Playback complete.", "accent");
@@ -1253,6 +1543,21 @@
         await fetch(`${baseUrl}/v1/audio/stop`, { method: "POST" });
       } catch (_) {
         // Ignore stop endpoint failures; local abort still proceeds.
+      }
+      if (state.liveSocket && state.activeSessionId) {
+        try {
+          state.liveSocket.send(JSON.stringify({
+            type: "session.cancel",
+            session_id: state.activeSessionId
+          }));
+        } catch (_) {
+          // Ignore live cancel transport failures.
+        }
+        try {
+          state.liveSocket.close();
+        } catch (_) {
+          // Ignore local socket close failures.
+        }
       }
       if (state.abortController) {
         state.abortController.abort();
@@ -1416,6 +1721,10 @@
       stopStreaming();
     });
 
+    el.downloadBtn.addEventListener("click", () => {
+      downloadLastGeneration();
+    });
+
     el.baseUrl.addEventListener("change", () => {
       refreshModelDropdown();
     });
@@ -1441,6 +1750,7 @@
     });
 
     state.stats = newStats();
+    setDownloadButtonState();
     updateStats();
     refreshModelDropdown(true);
   </script>

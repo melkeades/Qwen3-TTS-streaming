@@ -17,6 +17,7 @@ import base64
 import io
 import urllib.request
 from dataclasses import dataclass
+from threading import Condition
 from typing import Any, Dict, Generator, List, Optional, Tuple, Union
 from urllib.parse import urlparse
 
@@ -27,6 +28,7 @@ import torch
 from transformers import AutoConfig, AutoModel, AutoProcessor
 
 from ..core.models import Qwen3TTSConfig, Qwen3TTSForConditionalGeneration, Qwen3TTSProcessor
+from ..core.models.modeling_qwen3_tts import _add_ref_code_context, _crossfade, _sample_next_token
 
 AudioLike = Union[
     str,                     # wav path, URL, base64
@@ -49,6 +51,403 @@ class VoiceClonePromptItem:
     x_vector_only_mode: bool
     icl_mode: bool
     ref_text: Optional[str] = None
+
+
+class CustomVoiceStreamingSession:
+    def __init__(
+        self,
+        owner: "Qwen3TTSModel",
+        *,
+        speaker: str,
+        language: str,
+        instruct: Optional[str],
+        non_streaming_mode: bool,
+        emit_every_frames: int,
+        decode_window_frames: int,
+        overlap_samples: int,
+        max_frames: int,
+        use_optimized_decode: bool,
+        do_sample: bool,
+        top_k: int,
+        top_p: float,
+        temperature: float,
+        subtalker_dosample: bool,
+        subtalker_top_k: int,
+        subtalker_top_p: float,
+        subtalker_temperature: float,
+    ) -> None:
+        self.owner = owner
+        self.model = owner.model
+        self.speaker = speaker
+        self.language = language or "Auto"
+        self.instruct = instruct
+        self.non_streaming_mode = bool(non_streaming_mode)
+        self.emit_every_frames = int(emit_every_frames)
+        self.decode_window_frames = int(decode_window_frames)
+        self.overlap_samples = int(overlap_samples)
+        self.max_frames = int(max_frames)
+        self.use_optimized_decode = bool(use_optimized_decode)
+        self.do_sample = bool(do_sample)
+        self.top_k = int(top_k)
+        self.top_p = float(top_p)
+        self.temperature = float(temperature)
+        self.subtalker_dosample = bool(subtalker_dosample)
+        self.subtalker_top_k = int(subtalker_top_k)
+        self.subtalker_top_p = float(subtalker_top_p)
+        self.subtalker_temperature = float(subtalker_temperature)
+
+        self._condition = Condition()
+        self._cancelled = False
+        self._finished = False
+        self._started = False
+        self._closed = False
+
+        self._talker_input_embeds: Optional[torch.Tensor] = None
+        self._talker_attention_mask: Optional[torch.Tensor] = None
+        self._trailing_text_hidden: Optional[torch.Tensor] = None
+        self._tts_pad_embed: Optional[torch.Tensor] = None
+        self._eos_text_hidden: Optional[torch.Tensor] = None
+        self._past_key_values = None
+        self._past_hidden: Optional[torch.Tensor] = None
+        self._generation_step: Optional[int] = None
+        self._token: Optional[torch.Tensor] = None
+        self._text_frontier = 0
+        self._pause_generation_step = 0
+
+        self._eos_id = self.model.config.talker_config.codec_eos_token_id
+        vocab_size = self.model.config.talker_config.vocab_size
+        self._suppress_tokens = [
+            i for i in range(vocab_size - 1024, vocab_size) if i != self._eos_id
+        ]
+
+        self._ref_code_context: Optional[torch.Tensor] = None
+        self._ref_code_frames = 0
+        self._capture_ref_code_context_frames = 0
+        self._codes_buffer: list[torch.Tensor] = []
+        self._decoded_tail: Optional[np.ndarray] = None
+        self._frames_since_emit = 0
+        self._total_frames_emitted = 0
+
+    @torch.inference_mode()
+    def _tokenize_append_text(self, text: str) -> Optional[torch.Tensor]:
+        raw = text or ""
+        if not raw:
+            return None
+        ref_ids = self.owner._tokenize_texts([self.owner._build_ref_text(raw)])[0]
+        content_ids = ref_ids[:, 3:-2]
+        if content_ids.shape[1] <= 0:
+            return None
+        return self.model.talker.text_projection(self.model.talker.get_text_embeddings()(content_ids))
+
+    def _prepare_ref_code_context(self) -> None:
+        ref_code_context: Optional[torch.Tensor] = None
+        ref_code_frames = 0
+        if self.decode_window_frames > 0:
+            silence_ctx = getattr(self.model, "_stream_silence_ref_code_context", None)
+            if silence_ctx is None or silence_ctx.device != self.model.talker.device:
+                try:
+                    sr = int(getattr(self.model.speech_tokenizer, "output_sample_rate", 24000))
+                    silence_wav = np.zeros(int(sr * 0.25), dtype=np.float32)
+                    silence_enc = self.model.speech_tokenizer.encode(silence_wav, sr=sr)
+                    silence_codes = silence_enc.audio_codes[0].to(self.model.talker.device)
+                    if silence_codes.shape[0] > 0:
+                        repeat = (self.decode_window_frames + silence_codes.shape[0] - 1) // silence_codes.shape[0]
+                        silence_ctx = silence_codes.repeat((repeat, 1))[: self.decode_window_frames].contiguous()
+                        self.model._stream_silence_ref_code_context = silence_ctx
+                except Exception:
+                    silence_ctx = None
+            if silence_ctx is not None:
+                ref_code_context = silence_ctx
+                ref_code_frames = ref_code_context.shape[0]
+        self._ref_code_context = ref_code_context
+        self._ref_code_frames = int(ref_code_frames)
+
+    @torch.inference_mode()
+    def _initialize_locked(self, text: str) -> None:
+        if self._started:
+            return
+        if not text.strip():
+            return
+
+        languages = [self.language if self.language is not None else "Auto"]
+        speakers = [self.speaker]
+        input_ids = self.owner._tokenize_texts([self.owner._build_assistant_text(text)])
+        if self.instruct is None or self.instruct == "":
+            instruct_ids = [None]
+        else:
+            instruct_ids = [self.owner._tokenize_texts([self.owner._build_instruct_text(self.instruct)])[0]]
+
+        talker_input_embeds, talker_attention_mask, trailing_text_hiddens, tts_pad_embed = (
+            self.model._build_talker_inputs(
+                input_ids=input_ids,
+                instruct_ids=instruct_ids,
+                ref_ids=None,
+                voice_clone_prompt=None,
+                languages=languages,
+                speakers=speakers,
+                non_streaming_mode=self.non_streaming_mode,
+            )
+        )
+
+        self._talker_input_embeds = talker_input_embeds
+        self._talker_attention_mask = talker_attention_mask
+        self._tts_pad_embed = tts_pad_embed
+        self._eos_text_hidden = trailing_text_hiddens[:, -1:, :].clone()
+        self._trailing_text_hidden = trailing_text_hiddens[:, :-1, :].contiguous()
+        self._text_frontier = int(self._trailing_text_hidden.shape[1])
+        self._pause_generation_step = max(self._text_frontier, self.emit_every_frames)
+        self._prepare_ref_code_context()
+        self._capture_ref_code_context_frames = max(0, min(self.decode_window_frames, self.decode_window_frames))
+
+        self.model._last_stream_generated_ref_code_context = None
+
+        torch.compiler.cudagraph_mark_step_begin()
+        out = self.model.talker.forward(
+            inputs_embeds=self._talker_input_embeds,
+            attention_mask=self._talker_attention_mask,
+            use_cache=True,
+            output_hidden_states=True,
+            return_dict=True,
+            trailing_text_hidden=self._trailing_text_hidden,
+            tts_pad_embed=self._tts_pad_embed,
+            generation_step=None,
+            past_hidden=None,
+            past_key_values=None,
+            subtalker_dosample=self.subtalker_dosample,
+            subtalker_top_k=self.subtalker_top_k,
+            subtalker_top_p=self.subtalker_top_p,
+            subtalker_temperature=self.subtalker_temperature,
+        )
+        self._past_key_values = out.past_key_values
+        self._past_hidden = out.past_hidden
+        self._generation_step = int(out.generation_step)
+
+        last_logits = out.logits[:, -1, :]
+        if self.do_sample:
+            self._token = _sample_next_token(
+                last_logits,
+                self.temperature,
+                self.top_k,
+                self.top_p,
+                self._suppress_tokens,
+            )
+        else:
+            self._token = torch.argmax(last_logits, dim=-1)
+        self._started = True
+
+    @torch.inference_mode()
+    def append_text(self, text: str) -> None:
+        appended = text or ""
+        with self._condition:
+            if self._cancelled or self._finished:
+                raise RuntimeError("Session is closed for new text.")
+            if not self._started:
+                self._initialize_locked(appended)
+                self._condition.notify_all()
+                return
+            extra_hidden = self._tokenize_append_text(appended)
+            if extra_hidden is not None and extra_hidden.shape[1] > 0:
+                assert self._trailing_text_hidden is not None
+                self._trailing_text_hidden = torch.cat(
+                    [self._trailing_text_hidden, extra_hidden.to(self._trailing_text_hidden.device)],
+                    dim=1,
+                ).contiguous()
+                self._text_frontier = int(self._trailing_text_hidden.shape[1])
+            current_step = int(self._generation_step or 0)
+            self._pause_generation_step = max(self._text_frontier, current_step + self.emit_every_frames)
+            self._condition.notify_all()
+
+    @torch.inference_mode()
+    def finish(self) -> None:
+        with self._condition:
+            if self._finished:
+                return
+            self._finished = True
+            if self._started and self._eos_text_hidden is not None:
+                assert self._trailing_text_hidden is not None
+                self._trailing_text_hidden = torch.cat(
+                    [self._trailing_text_hidden, self._eos_text_hidden.to(self._trailing_text_hidden.device)],
+                    dim=1,
+                ).contiguous()
+                self._text_frontier = int(self._trailing_text_hidden.shape[1])
+            self._condition.notify_all()
+
+    def cancel(self) -> None:
+        with self._condition:
+            self._cancelled = True
+            self._condition.notify_all()
+
+    def is_started(self) -> bool:
+        with self._condition:
+            return self._started
+
+    def is_closed(self) -> bool:
+        with self._condition:
+            return self._closed or self._cancelled
+
+    def _capture_generated_ref_context(self, codes_buffer: list[torch.Tensor]) -> None:
+        capture_frames = max(0, int(self._capture_ref_code_context_frames))
+        if capture_frames <= 0 or not codes_buffer:
+            return
+        tail_start = max(0, len(codes_buffer) - capture_frames)
+        tail_codes = torch.stack(codes_buffer[tail_start:], dim=0).detach().cpu().contiguous()
+        self.model._last_stream_generated_ref_code_context = tail_codes
+
+    @torch.inference_mode()
+    def stream_audio(self) -> Generator[Tuple[np.ndarray, int], None, None]:
+        with self._condition:
+            if not self._started:
+                raise RuntimeError("Cannot stream before the first text chunk arrives.")
+            if self._closed or self._cancelled:
+                return
+
+        for _step_idx in range(self.max_frames):
+            with self._condition:
+                if self._cancelled:
+                    return
+                if (
+                    not self._finished
+                    and self._generation_step is not None
+                    and self._generation_step >= self._pause_generation_step
+                ):
+                    return
+                trailing_text_hidden = self._trailing_text_hidden
+                tts_pad_embed = self._tts_pad_embed
+                token = self._token
+                past_key_values = self._past_key_values
+                past_hidden = self._past_hidden
+                generation_step = self._generation_step
+
+            if (
+                trailing_text_hidden is None
+                or tts_pad_embed is None
+                or token is None
+                or generation_step is None
+            ):
+                return
+
+            torch.compiler.cudagraph_mark_step_begin()
+            step_out = self.model.talker.forward(
+                input_ids=token.unsqueeze(1),
+                use_cache=True,
+                return_dict=True,
+                output_hidden_states=False,
+                past_key_values=past_key_values,
+                past_hidden=past_hidden,
+                generation_step=generation_step,
+                trailing_text_hidden=trailing_text_hidden,
+                tts_pad_embed=tts_pad_embed,
+                subtalker_dosample=self.subtalker_dosample,
+                subtalker_top_k=self.subtalker_top_k,
+                subtalker_top_p=self.subtalker_top_p,
+                subtalker_temperature=self.subtalker_temperature,
+            )
+
+            next_generation_step = int(step_out.generation_step)
+            codec_ids = step_out.hidden_states[1]
+            step_logits = step_out.logits[:, -1, :]
+            if self.do_sample:
+                next_token = _sample_next_token(
+                    step_logits,
+                    self.temperature,
+                    self.top_k,
+                    self.top_p,
+                    self._suppress_tokens,
+                )
+            else:
+                next_token = torch.argmax(step_logits, dim=-1)
+
+            with self._condition:
+                self._past_key_values = step_out.past_key_values
+                self._past_hidden = step_out.past_hidden
+                self._generation_step = next_generation_step
+                self._token = next_token
+                finished = self._finished
+
+            if codec_ids[0, 0] == self._eos_id:
+                if finished:
+                    break
+                continue
+
+            self._codes_buffer.append(codec_ids[0].detach())
+            self._frames_since_emit += 1
+            if self._frames_since_emit < self.emit_every_frames:
+                continue
+            self._frames_since_emit = 0
+
+            start = max(0, len(self._codes_buffer) - self.decode_window_frames)
+            window_codes = torch.stack(self._codes_buffer[start:], dim=0)
+            window, _ = _add_ref_code_context(
+                window_codes,
+                self._ref_code_context,
+                self._ref_code_frames,
+                self.decode_window_frames,
+            )
+
+            if self.use_optimized_decode and hasattr(self.model.speech_tokenizer, "decode_streaming"):
+                can_use_padded_optimized = window.shape[0] >= self.decode_window_frames
+                if can_use_padded_optimized:
+                    wavs, sr = self.model.speech_tokenizer.decode_streaming(
+                        window.to(self.model.talker.device),
+                        use_optimized=True,
+                        pad_to_size=self.decode_window_frames,
+                    )
+                else:
+                    wavs, sr = self.model.speech_tokenizer.decode(
+                        [{"audio_codes": window.to(self.model.talker.device)}]
+                    )
+            else:
+                wavs, sr = self.model.speech_tokenizer.decode(
+                    [{"audio_codes": window.to(self.model.talker.device)}]
+                )
+
+            wav = wavs[0].astype(np.float32)
+            samples_per_frame = self.model.speech_tokenizer.get_decode_upsample_rate()
+            step_samples = samples_per_frame * self.emit_every_frames
+            chunk = wav[-step_samples:] if step_samples > 0 else wav
+
+            if self._decoded_tail is not None and self.overlap_samples > 0:
+                ov = min(self.overlap_samples, len(self._decoded_tail), len(chunk))
+                if ov > 0:
+                    head = _crossfade(self._decoded_tail[-ov:], chunk[:ov])
+                    chunk = np.concatenate([head, chunk[ov:]], axis=0)
+
+            self._decoded_tail = chunk.copy()
+            self._total_frames_emitted = len(self._codes_buffer)
+            yield chunk, sr
+
+        self._capture_generated_ref_context(self._codes_buffer)
+
+        remaining_frames = len(self._codes_buffer) - self._total_frames_emitted
+        if remaining_frames > 0:
+            context_frames = min(self._total_frames_emitted, self.decode_window_frames - remaining_frames)
+            start_idx = self._total_frames_emitted - context_frames
+            window_codes = torch.stack(self._codes_buffer[start_idx:], dim=0)
+            window, flush_ref_prefix_frames = _add_ref_code_context(
+                window_codes,
+                self._ref_code_context,
+                self._ref_code_frames,
+                self.decode_window_frames,
+            )
+            wavs, sr = self.model.speech_tokenizer.decode(
+                [{"audio_codes": window.to(self.model.talker.device)}]
+            )
+            wav = wavs[0].astype(np.float32)
+            skip_frames = flush_ref_prefix_frames + context_frames
+            if skip_frames > 0:
+                samples_per_frame = len(wav) / window.shape[0]
+                skip_samples = int(skip_frames * samples_per_frame)
+                wav = wav[skip_samples:]
+            if self._decoded_tail is not None and self.overlap_samples > 0 and len(wav) > 0:
+                ov = min(self.overlap_samples, len(self._decoded_tail), len(wav))
+                if ov > 0:
+                    head = _crossfade(self._decoded_tail[-ov:], wav[:ov])
+                    wav = np.concatenate([head, wav[ov:]], axis=0)
+            yield wav, sr
+
+        self._capture_generated_ref_context(self._codes_buffer)
+        with self._condition:
+            self._closed = True
 
 
 class Qwen3TTSModel:
@@ -1015,6 +1414,73 @@ class Qwen3TTSModel:
         return wavs, fs
 
     # custom voice model
+    def create_custom_voice_session(
+        self,
+        *,
+        speaker: str,
+        language: str = None,
+        instruct: Optional[str] = None,
+        non_streaming_mode: bool = False,
+        emit_every_frames: int = 8,
+        decode_window_frames: int = 80,
+        overlap_samples: int = 0,
+        max_frames: int = 10000,
+        use_optimized_decode: bool = True,
+        **kwargs,
+    ) -> CustomVoiceStreamingSession:
+        if self.model.tts_model_type != "custom_voice":
+            raise ValueError(
+                f"model with tts_model_type={self.model.tts_model_type} "
+                "does not support create_custom_voice_session"
+            )
+
+        languages = [language if language is not None else "Auto"]
+        speakers = [speaker]
+
+        if self.model.tts_model_size in "0b6":
+            instruct = None
+
+        self._validate_languages(languages)
+        self._validate_speakers(speakers)
+
+        gen_kwargs = self._merge_generate_kwargs(**kwargs)
+        supported_params = {
+            "do_sample", "top_k", "top_p", "temperature",
+            "subtalker_dosample", "subtalker_top_k", "subtalker_top_p", "subtalker_temperature"
+        }
+        gen_kwargs = {k: v for k, v in gen_kwargs.items() if k in supported_params}
+        defaults = {
+            "do_sample": True,
+            "top_k": 50,
+            "top_p": 1.0,
+            "temperature": 0.9,
+            "subtalker_dosample": True,
+            "subtalker_top_k": 50,
+            "subtalker_top_p": 1.0,
+            "subtalker_temperature": 0.9,
+        }
+        defaults.update(gen_kwargs)
+        return CustomVoiceStreamingSession(
+            self,
+            speaker=speaker,
+            language=languages[0],
+            instruct=instruct,
+            non_streaming_mode=non_streaming_mode,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
+            do_sample=bool(defaults["do_sample"]),
+            top_k=int(defaults["top_k"]),
+            top_p=float(defaults["top_p"]),
+            temperature=float(defaults["temperature"]),
+            subtalker_dosample=bool(defaults["subtalker_dosample"]),
+            subtalker_top_k=int(defaults["subtalker_top_k"]),
+            subtalker_top_p=float(defaults["subtalker_top_p"]),
+            subtalker_temperature=float(defaults["subtalker_temperature"]),
+        )
+
     @torch.inference_mode()
     def stream_generate_custom_voice(
         self,

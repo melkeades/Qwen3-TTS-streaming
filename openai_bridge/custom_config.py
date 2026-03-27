@@ -42,6 +42,7 @@ class CustomBridgeConfig:
     optimize_compile_codebook_predictor: bool
     optimize_compile_talker: bool
     stream_use_optimized_decode: bool
+    stream_greedy_decoding: bool
     continuation_default_frames: int
     continuation_cache_ttl_sec: int
     continuation_cache_max_entries: int
@@ -138,7 +139,8 @@ class CustomBridgeConfig:
                 "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice",
             ),
             fallback_speaker=fallback_speaker,
-            device_map=os.getenv("CUSTOM_BRIDGE_DEVICE_MAP", "cuda:0"),
+            # Hard-pinned for this deployment target.
+            device_map="cuda:0",
             dtype=os.getenv("CUSTOM_BRIDGE_DTYPE", "bfloat16"),
             attn_implementation=os.getenv(
                 "CUSTOM_BRIDGE_ATTN_IMPL", "flash_attention_2"
@@ -173,6 +175,9 @@ class CustomBridgeConfig:
             ),
             stream_use_optimized_decode=cls._env_bool(
                 "CUSTOM_BRIDGE_STREAM_USE_OPTIMIZED_DECODE", True
+            ),
+            stream_greedy_decoding=cls._env_bool(
+                "CUSTOM_BRIDGE_STREAM_GREEDY_DECODING", False
             ),
             continuation_default_frames=int(
                 os.getenv("CUSTOM_BRIDGE_CONTINUATION_DEFAULT_FRAMES", "48")

@@ -109,10 +109,51 @@ class ContinuationState:
     emitted_head_rms: float = 0.0
 
 
+class LiveCustomVoiceSession:
+    def __init__(
+        self,
+        *,
+        pipeline: "QwenCustomStreamingPipeline",
+        model_session,
+        response_format: str,
+    ) -> None:
+        self.pipeline = pipeline
+        self.model_session = model_session
+        self.response_format = response_format
+
+    def append_text(self, text: str) -> None:
+        self.model_session.append_text(text)
+
+    def is_started(self) -> bool:
+        return bool(self.model_session.is_started())
+
+    def is_closed(self) -> bool:
+        return bool(self.model_session.is_closed())
+
+    def finish(self) -> None:
+        self.model_session.finish()
+
+    def cancel(self) -> None:
+        self.model_session.cancel()
+
+    def stream_bytes(self) -> Iterator[bytes]:
+        if self.response_format == "wav":
+            yield wav_header(
+                sample_rate=self.pipeline.config.sample_rate,
+                bits_per_sample=self.pipeline.config.bits_per_sample,
+                channels=self.pipeline.config.channels,
+            )
+        for chunk, _sr in self.model_session.stream_audio():
+            pcm = self.pipeline._float_audio_to_pcm16_bytes(chunk)
+            if pcm:
+                yield pcm
+
+
 class QwenCustomStreamingPipeline:
     def __init__(self, config: CustomBridgeConfig):
         self.config = config
         self.model: Qwen3TTSModel | None = None
+        self._runtime_device_map: str = config.device_map
         self._supported_speakers: set[str] | None = None
         self._speaker_names: list[str] = []
         self._active_model_id: str | None = None
@@ -411,11 +452,18 @@ class QwenCustomStreamingPipeline:
 
     def _load_model_unlocked(self, *, model_id: str, model_ref: str) -> _ModelCacheEntry:
         self._startup_ready = False
+        runtime_device_map = self._resolve_cuda_device_unlocked()
+        self._runtime_device_map = runtime_device_map
         torch.set_float32_matmul_precision("high")
-        logger.info("Loading CustomVoice model id=%s ref=%s", model_id, model_ref)
+        logger.info(
+            "Loading CustomVoice model id=%s ref=%s device=%s",
+            model_id,
+            model_ref,
+            runtime_device_map,
+        )
         model = Qwen3TTSModel.from_pretrained(
             model_ref,
-            device_map=self.config.device_map,
+            device_map=runtime_device_map,
             dtype=_dtype_from_str(self.config.dtype),
             attn_implementation=self.config.attn_implementation,
         )
@@ -455,6 +503,41 @@ class QwenCustomStreamingPipeline:
             self._startup_ready,
         )
         return entry
+
+    def _resolve_cuda_device_unlocked(self) -> str:
+        preferred = "cuda:0"
+        if not torch.cuda.is_available():
+            logger.warning(
+                "CUDA unavailable; falling back to configured device_map='%s'.",
+                self.config.device_map,
+            )
+            return self.config.device_map
+
+        device_count = int(torch.cuda.device_count())
+        if device_count <= 0:
+            logger.warning(
+                "CUDA reported available but no visible devices; using configured device_map='%s'.",
+                self.config.device_map,
+            )
+            return self.config.device_map
+
+        first_name = str(torch.cuda.get_device_name(0) or "")
+        if "5090" in first_name.lower():
+            logger.info("Pinned GPU confirmed: device=%s name=%s", preferred, first_name)
+            return preferred
+
+        # Prefer the first non-zero GPU if cuda:0 is not a 5090.
+        fallback_index = 1 if device_count > 1 else 0
+        fallback_name = str(torch.cuda.get_device_name(fallback_index) or "")
+        fallback_device = f"cuda:{fallback_index}"
+        logger.warning(
+            "Preferred %s is '%s' (not 5090). Falling back to %s ('%s').",
+            preferred,
+            first_name,
+            fallback_device,
+            fallback_name,
+        )
+        return fallback_device
 
     def ensure_model_loaded(self, model_id: str) -> str:
         requested_model = (model_id or "").strip()
@@ -944,6 +1027,61 @@ class QwenCustomStreamingPipeline:
     def speaker_names(self) -> list[str]:
         return list(self._speaker_names)
 
+    def create_live_session(
+        self,
+        *,
+        req: SpeechSynthesisParams,
+        speaker: str,
+    ) -> LiveCustomVoiceSession:
+        if self.model is None:
+            raise RuntimeError("Pipeline not loaded")
+
+        language = req.language or self.config.default_language
+        instruct = (
+            req.instructions
+            if req.instructions is not None
+            else (req.instruct if req.instruct is not None else self.config.default_instruct)
+        )
+        emit_every_frames = req.emit_every_frames or self.config.emit_every_frames
+        decode_window_frames = req.decode_window_frames or self.config.decode_window_frames
+        overlap_samples = (
+            req.overlap_samples if req.overlap_samples is not None else self.config.overlap_samples
+        )
+        max_frames = req.max_frames or self.config.max_frames
+        use_optimized_decode = (
+            req.use_optimized_decode
+            if req.use_optimized_decode is not None
+            else self.config.stream_use_optimized_decode
+        )
+        gen_kwargs: dict[str, object] = {}
+        if bool(self.config.stream_greedy_decoding):
+            gen_kwargs.update(
+                do_sample=False,
+                subtalker_dosample=False,
+                temperature=0.0,
+                top_k=1,
+                top_p=1.0,
+                subtalker_temperature=0.0,
+                subtalker_top_k=1,
+                subtalker_top_p=1.0,
+            )
+        model_session = self.model.create_custom_voice_session(
+            speaker=speaker,
+            language=language,
+            instruct=instruct,
+            emit_every_frames=emit_every_frames,
+            decode_window_frames=decode_window_frames,
+            overlap_samples=overlap_samples,
+            max_frames=max_frames,
+            use_optimized_decode=use_optimized_decode,
+            **gen_kwargs,
+        )
+        return LiveCustomVoiceSession(
+            pipeline=self,
+            model_session=model_session,
+            response_format=req.response_format,
+        )
+
     def stream_audio_chunks(
         self,
         req: SpeechSynthesisParams,
@@ -977,6 +1115,17 @@ class QwenCustomStreamingPipeline:
             speaker=speaker,
         )
         gen_kwargs: dict[str, object] = {}
+        if bool(self.config.stream_greedy_decoding):
+            gen_kwargs.update(
+                do_sample=False,
+                subtalker_dosample=False,
+                temperature=0.0,
+                top_k=1,
+                top_p=1.0,
+                subtalker_temperature=0.0,
+                subtalker_top_k=1,
+                subtalker_top_p=1.0,
+            )
         text_to_synthesize = req.input
         tail_keep_samples = self._continuation_tail_keep_samples()
         emitted_tail_audio: np.ndarray | None = None

@@ -89,6 +89,11 @@ def _sample_next_token(
     logits = logits / temperature
     logits = _top_k_top_p_filtering(logits, top_k=top_k, top_p=top_p)
     probs = torch.softmax(logits, dim=-1)
+    if probs.device.type == "cuda":
+        # torch.multinomial() can trip compiled CUDA-graph capture in streaming mode.
+        # Sampling on CPU keeps the optimized decode path intact while avoiding that failure.
+        sampled = torch.multinomial(probs.float().cpu(), num_samples=1).squeeze(-1)
+        return sampled.to(device=probs.device)
     return torch.multinomial(probs, num_samples=1).squeeze(-1)
 
 

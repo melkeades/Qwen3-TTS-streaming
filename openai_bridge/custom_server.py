@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import base64
 import logging
 import re
 import time
@@ -10,7 +11,7 @@ from dataclasses import dataclass, replace
 from threading import Event, Lock
 from typing import Any
 
-from fastapi import FastAPI, HTTPException
+from fastapi import FastAPI, HTTPException, WebSocket, WebSocketDisconnect
 from fastapi.exceptions import RequestValidationError
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse, JSONResponse, Response, StreamingResponse
@@ -129,25 +130,35 @@ class CustomBridgeRuntime:
     config: CustomBridgeConfig
     pipeline: QwenCustomStreamingPipeline
     _active: dict[str, Event]
+    _active_cancellers: dict[str, Any]
     _buffered_sessions: dict[str, BufferedSpeechSession]
     _lock: Lock
 
-    def register_stream(self) -> tuple[str, Event]:
+    def register_stream(self, canceler: Any = None) -> tuple[str, Event]:
         stream_id = str(uuid.uuid4())
         ev = Event()
         with self._lock:
             self._active[stream_id] = ev
+            if canceler is not None:
+                self._active_cancellers[stream_id] = canceler
         return stream_id, ev
 
     def unregister_stream(self, stream_id: str) -> None:
         with self._lock:
             self._active.pop(stream_id, None)
+            self._active_cancellers.pop(stream_id, None)
 
     def cancel_all(self) -> int:
         with self._lock:
             events = list(self._active.values())
+            cancellers = list(self._active_cancellers.values())
         for ev in events:
             ev.set()
+        for canceler in cancellers:
+            try:
+                canceler()
+            except Exception:
+                logger.debug("active stream canceler failed", exc_info=True)
         return len(events)
 
     def active_count(self) -> int:
@@ -358,6 +369,26 @@ def _format_available_speakers(speakers: list[str], limit: int = 24) -> str:
     return f"{shown}, ... (+{remaining} more)"
 
 
+def _live_req_from_payload(payload: dict[str, Any]) -> SpeechSynthesisParams:
+    voice = str(payload.get("voice") or payload.get("speaker") or "").strip()
+    return SpeechSynthesisParams(
+        model=str(payload.get("model") or "").strip(),
+        input="live-session",
+        voice=voice,
+        speaker=str(payload.get("speaker") or voice or "").strip() or None,
+        instructions=payload.get("instructions"),
+        instruct=payload.get("instruct"),
+        language=payload.get("language"),
+        response_format=str(payload.get("response_format") or "pcm").strip(),
+        speed=float(payload.get("speed") or 1.0),
+        emit_every_frames=payload.get("emit_every_frames"),
+        decode_window_frames=payload.get("decode_window_frames"),
+        overlap_samples=payload.get("overlap_samples"),
+        max_frames=payload.get("max_frames"),
+        use_optimized_decode=payload.get("use_optimized_decode"),
+    )
+
+
 def create_app() -> FastAPI:
     config = CustomBridgeConfig.from_env()
 
@@ -413,6 +444,7 @@ def create_app() -> FastAPI:
             config=active_config,
             pipeline=pipeline,
             _active={},
+            _active_cancellers={},
             _buffered_sessions={},
             _lock=Lock(),
         )
@@ -478,6 +510,7 @@ def create_app() -> FastAPI:
             "default_speaker": runtime.config.default_speaker,
             "default_language": runtime.config.default_language,
             "stream_use_optimized_decode": runtime.config.stream_use_optimized_decode,
+            "stream_greedy_decoding": runtime.config.stream_greedy_decoding,
             "continuation_default_frames": runtime.config.continuation_default_frames,
             "continuation_cache_ttl_sec": runtime.config.continuation_cache_ttl_sec,
             "continuation_cache_max_entries": runtime.config.continuation_cache_max_entries,
@@ -610,6 +643,288 @@ def create_app() -> FastAPI:
         cleared = runtime.clear_buffered_session(requested_session)
         runtime.pipeline.clear_continuation_session(requested_session)
         return cleared
+
+    @app.websocket("/v1/audio/speech/live")
+    async def v1_audio_speech_live(websocket: WebSocket) -> None:
+        await websocket.accept()
+        runtime: CustomBridgeRuntime = app.state.runtime
+        outbound: asyncio.Queue[dict[str, Any] | None] = asyncio.Queue()
+
+        session_id = ""
+        session_req: SpeechSynthesisParams | None = None
+        speaker = ""
+        live_session = None
+        stream_id: str | None = None
+        cancel_event: Event | None = None
+        response_format = "pcm"
+        pump_event = asyncio.Event()
+
+        def cancel_current() -> None:
+            if cancel_event is not None:
+                cancel_event.set()
+            if live_session is not None:
+                try:
+                    live_session.cancel()
+                except Exception:
+                    logger.debug("live session cancel failed", exc_info=True)
+
+        async def sender() -> None:
+            while True:
+                message = await outbound.get()
+                if message is None:
+                    return
+                await websocket.send_json(message)
+
+        async def pump() -> None:
+            while True:
+                await pump_event.wait()
+                pump_event.clear()
+                if live_session is None:
+                    continue
+                try:
+                    while True:
+                        emitted_any = False
+                        for chunk in live_session.stream_bytes():
+                            emitted_any = True
+                            await outbound.put(
+                                {
+                                    "type": "audio.delta",
+                                    "session_id": session_id,
+                                    "format": response_format,
+                                    "sample_rate": runtime.config.sample_rate,
+                                    "channels": runtime.config.channels,
+                                    "bits_per_sample": runtime.config.bits_per_sample,
+                                    "data": base64.b64encode(chunk).decode("ascii"),
+                                }
+                            )
+                            await asyncio.sleep(0)
+                        if live_session.is_closed():
+                            await outbound.put(
+                                {
+                                    "type": "session.done",
+                                    "session_id": session_id,
+                                    "cancelled": bool(cancel_event.is_set()) if cancel_event is not None else False,
+                                }
+                            )
+                            await outbound.put(None)
+                            return
+                        if not emitted_any:
+                            break
+                except Exception as exc:
+                    logger.exception("live speech pump failed")
+                    await outbound.put(
+                        {
+                            "type": "error",
+                            "session_id": session_id,
+                            "message": str(exc),
+                        }
+                    )
+                    await outbound.put(None)
+                    return
+
+        async def receiver() -> None:
+            nonlocal session_id, session_req, speaker, live_session
+            nonlocal stream_id, cancel_event, response_format
+
+            while True:
+                payload = await websocket.receive_json()
+                message_type = str(payload.get("type") or "").strip()
+                requested_session_id = str(payload.get("session_id") or "").strip()
+
+                if message_type == "session.start":
+                    if session_req is not None:
+                        await outbound.put(
+                            {
+                                "type": "error",
+                                "session_id": session_id,
+                                "message": "session.start already received for this websocket.",
+                            }
+                        )
+                        continue
+                    session_id = requested_session_id or str(uuid.uuid4())
+                    try:
+                        req = _live_req_from_payload(payload)
+                    except Exception as exc:
+                        await outbound.put(
+                            {
+                                "type": "error",
+                                "session_id": session_id,
+                                "message": str(exc),
+                            }
+                        )
+                        continue
+
+                    req_model = req.model.strip()
+                    active_model = runtime.pipeline.active_model_id
+                    if active_model and req_model != active_model and runtime.active_count() > 0:
+                        await outbound.put(
+                            {
+                                "type": "error",
+                                "session_id": session_id,
+                                "message": (
+                                    f"Cannot switch model from '{active_model}' to '{req_model}' "
+                                    "while streams are active."
+                                ),
+                            }
+                        )
+                        continue
+                    try:
+                        runtime.pipeline.ensure_model_loaded(req_model)
+                    except ValueError as exc:
+                        await outbound.put(
+                            {
+                                "type": "error",
+                                "session_id": session_id,
+                                "message": str(exc),
+                            }
+                        )
+                        continue
+
+                    speaker = (req.speaker or req.voice or runtime.config.default_speaker).strip()
+                    if not speaker:
+                        await outbound.put(
+                            {
+                                "type": "error",
+                                "session_id": session_id,
+                                "message": "Missing speaker. Provide 'voice' or 'speaker'.",
+                            }
+                        )
+                        continue
+                    if not runtime.pipeline.has_speaker(speaker):
+                        await outbound.put(
+                            {
+                                "type": "error",
+                                "session_id": session_id,
+                                "message": (
+                                    f"Unknown speaker '{speaker}'. "
+                                    f"Available: {_format_available_speakers(runtime.pipeline.speaker_names())}"
+                                ),
+                            }
+                        )
+                        continue
+
+                    response_format = req.response_format
+                    session_req = req
+                    live_session = runtime.pipeline.create_live_session(req=req, speaker=speaker)
+                    stream_id, cancel_event = runtime.register_stream(canceler=cancel_current)
+                    await outbound.put(
+                        {
+                            "type": "session.ready",
+                            "session_id": session_id,
+                            "model": runtime.pipeline.active_model_id or req_model,
+                            "speaker": speaker,
+                            "language": req.language or runtime.config.default_language,
+                            "response_format": response_format,
+                        }
+                    )
+                    continue
+
+                if session_req is None:
+                    await outbound.put(
+                        {
+                            "type": "error",
+                            "session_id": requested_session_id or "",
+                            "message": "session.start must be sent before other events.",
+                        }
+                    )
+                    continue
+
+                if requested_session_id and requested_session_id != session_id:
+                    await outbound.put(
+                        {
+                            "type": "error",
+                            "session_id": session_id,
+                            "message": "session_id does not match the active websocket session.",
+                        }
+                    )
+                    continue
+
+                if message_type == "text.append":
+                    text = str(payload.get("text") or "")
+                    if not text:
+                        continue
+                    assert live_session is not None
+                    live_session.append_text(text)
+                    pump_event.set()
+                    continue
+
+                if message_type == "session.finish":
+                    if live_session is None:
+                        await outbound.put(
+                            {
+                                "type": "session.done",
+                                "session_id": session_id,
+                                "cancelled": False,
+                            }
+                        )
+                        await outbound.put(None)
+                        return
+                    live_session.finish()
+                    pump_event.set()
+                    await outbound.put(
+                        {
+                            "type": "session.draining",
+                            "session_id": session_id,
+                        }
+                    )
+                    if not live_session.is_started():
+                        await outbound.put(
+                            {
+                                "type": "session.done",
+                                "session_id": session_id,
+                                "cancelled": False,
+                            }
+                        )
+                        await outbound.put(None)
+                        return
+                    continue
+
+                if message_type == "session.cancel":
+                    cancel_current()
+                    await outbound.put(
+                        {
+                            "type": "session.done",
+                            "session_id": session_id,
+                            "cancelled": True,
+                        }
+                    )
+                    await outbound.put(None)
+                    return
+
+                await outbound.put(
+                    {
+                        "type": "error",
+                        "session_id": session_id,
+                        "message": f"Unknown message type '{message_type}'.",
+                    }
+                )
+
+        sender_task = asyncio.create_task(sender())
+        receiver_task = asyncio.create_task(receiver())
+        pump_task = asyncio.create_task(pump())
+        try:
+            done, pending = await asyncio.wait(
+                {sender_task, receiver_task, pump_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+            for task in pending:
+                task.cancel()
+            for task in done:
+                if task.cancelled():
+                    continue
+                exc = task.exception()
+                if exc is not None and not isinstance(exc, WebSocketDisconnect):
+                    raise exc
+        except WebSocketDisconnect:
+            cancel_current()
+        finally:
+            cancel_current()
+            pump_event.set()
+            if stream_id is not None:
+                runtime.unregister_stream(stream_id)
+            for task in (sender_task, receiver_task, pump_task):
+                if not task.done():
+                    task.cancel()
 
     @app.post("/v1/audio/speech")
     async def v1_audio_speech(req: SpeechSynthesisParams):

@@ -36,6 +36,7 @@ Built-in HTML clients:
 Common:
 
 - `POST /v1/audio/speech` (streaming PCM/WAV)
+- `WS /v1/audio/speech/live` (CustomVoice live append-text session)
 - `POST /v1/audio/stop`
 - `GET /v1/models`
 - `GET /healthz`
@@ -62,6 +63,12 @@ Request compatibility notes:
   - `end_of_message=true` flushes any trailing unsent text in the session.
   - Backend continuation is session-owned and uses cached acoustic tail state to improve cross-request continuity.
   - Buffered chunks in the same session must keep the same synthesis settings (`model`, `voice`/`speaker`, language, instructions, format, decode params).
+- Custom bridge live websocket mode:
+  - `session.start` configures one backend-owned CustomVoice session.
+  - `text.append` extends the active text frontier without restarting Qwen generation.
+  - `session.finish` appends the final EOS-style text conditioning and lets the live session drain normally.
+  - `session.cancel` aborts the live session.
+  - Server emits `session.ready`, `audio.delta`, `session.draining`, `session.done`, and `error`.
 
 Validation scripts:
 
@@ -74,7 +81,7 @@ Validation scripts:
 - AuthN/AuthZ: no API keys, no RBAC, no multi-tenant security boundary.
 - Rate limiting / quotas / admission control.
 - Persistent model cache across process restarts (cache is in-memory only).
-- WebSocket/SSE transport (HTTP chunked streaming only).
+- SSE transport.
 - Production telemetry stack (structured metrics/tracing export).
 - Full OpenAI parity beyond implemented TTS subset.
 
@@ -94,4 +101,4 @@ Validation scripts:
 3. Add objective audio regression checks for first-second quality.
 4. Add bounded cache policy (LRU / max VRAM budget).
 5. Add Prometheus-style metrics and structured traces.
-6. Add optional WebSocket transport for tighter interactive control.
+6. Add browser/client support around the live websocket session API.

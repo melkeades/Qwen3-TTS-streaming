@@ -1,0 +1,123 @@
+- generic [ref=e2]:
+  - generic [ref=e3]:
+    - heading "Qwen CustomVoice Bridge Client" [level=1] [ref=e4]
+    - paragraph [ref=e5]: Dedicated live client for the CustomVoice model with speaker and style instruction controls.
+    - generic [ref=e6]:
+      - generic [ref=e7]:
+        - generic [ref=e8]:
+          - generic [ref=e9]: Base URL
+          - textbox "Base URL" [ref=e10]: http://127.0.0.1:8040
+        - generic [ref=e11]:
+          - generic [ref=e12]: Model
+          - combobox "Model" [ref=e13]:
+            - option "None (select model)"
+            - option "output/test" [selected]
+            - option "Qwen/Qwen3-TTS-12Hz-1.7B-CustomVoice"
+            - option "output/favwav/checkpoint-epoch-0"
+            - option "output/favwav/checkpoint-epoch-199"
+            - option "output/favwav/checkpoint-epoch-249"
+            - option "output/favwav/checkpoint-epoch-299"
+            - option "output/favwav/checkpoint-epoch-9"
+            - option "output/favwav/checkpoint-epoch-99"
+        - generic [ref=e14]:
+          - generic [ref=e15]: Speaker (OpenAI voice field)
+          - combobox "Speaker (OpenAI voice field)" [ref=e16]:
+            - option "None (server default)"
+            - option "aiden"
+            - option "dylan"
+            - option "eric"
+            - option "ono_anna"
+            - option "p3" [selected]
+            - option "ryan"
+            - option "serena"
+            - option "sohee"
+            - option "uncle_fu"
+            - option "vivian"
+        - generic [ref=e17]:
+          - generic [ref=e18]: Response Format
+          - combobox "Response Format" [ref=e19]:
+            - option "pcm (lowest latency)" [selected]
+            - option "wav"
+      - generic [ref=e20]:
+        - generic [ref=e21]:
+          - generic [ref=e22]: Speed (API field)
+          - spinbutton "Speed (API field)" [ref=e23]: "1.0"
+        - generic [ref=e24]:
+          - generic [ref=e25]: Language
+          - textbox "Language" [ref=e26]: English
+        - generic [ref=e27]:
+          - generic [ref=e28]: Instruction (style)
+          - textbox "Instruction (style)" [ref=e29]: very angry, livid
+      - generic [ref=e30]:
+        - generic [ref=e31]:
+          - generic [ref=e32]: Max chars per segment
+          - spinbutton "Max chars per segment" [ref=e33]: "280"
+        - generic [ref=e34]:
+          - generic [ref=e35]: First-segment char cap (TTFB)
+          - spinbutton "First-segment char cap (TTFB)" [ref=e36]: "110"
+        - generic [ref=e37]:
+          - generic [ref=e38]: Session ID (bridge-only)
+          - textbox "Session ID (bridge-only)" [ref=e39]:
+            - /placeholder: auto-generated when backend live session is enabled
+            - text: dfa2da76-2b91-4f45-8492-79ed8db1bee5
+      - generic [ref=e40]:
+        - checkbox "Client-side segmentation (experimental). Prefer backend chunking for correctness." [ref=e41]
+        - generic [ref=e42]: Client-side segmentation (experimental). Prefer backend chunking for correctness.
+      - generic [ref=e43]:
+        - 'checkbox "Use backend live session across chunks (opens `WS /v1/audio/speech/live` and appends text into one server-owned Qwen session)." [checked] [ref=e44]'
+        - generic [ref=e45]: "Use backend live session across chunks (opens `WS /v1/audio/speech/live` and appends text into one server-owned Qwen session)."
+      - generic [ref=e46]:
+        - generic [ref=e47]: Prompt
+        - textbox "Prompt" [ref=e48]: And you know what? This cracks me up. I voted for you, and you pissed all over it. I am talking, and you are listening.
+      - generic [ref=e49]:
+        - button "Run Custom Stream" [ref=e50] [cursor=pointer]
+        - button "Custom Warmup" [ref=e51] [cursor=pointer]
+        - button "Refresh Models" [ref=e52] [cursor=pointer]
+        - button "Unload Model" [ref=e53] [cursor=pointer]
+        - button "Unload All" [ref=e54] [cursor=pointer]
+        - button "Stop" [disabled] [ref=e55]
+    - generic [ref=e56]: Playback complete.
+    - generic [ref=e57]: "[12:31:23 AM] stream mode: pcm, segmented: false, backend_live: true [12:31:23 AM] segments: 1 [12:31:23 AM] session id: dfa2da76-2b91-4f45-8492-79ed8db1bee5 [12:31:23 AM] live session ready: dfa2da76-2b91-4f45-8492-79ed8db1bee5 [12:31:23 AM] live append 1/1 (119 chars) [12:31:23 AM] live session draining [12:31:28 AM] live session completed"
+  - generic [ref=e58]:
+    - heading "Stats" [level=2] [ref=e59]
+    - generic [ref=e60]:
+      - generic [ref=e61]:
+        - generic [ref=e62]: HTTP status
+        - generic [ref=e63]: "101"
+      - generic [ref=e64]:
+        - generic [ref=e65]: Segments
+        - generic [ref=e66]: "1"
+      - generic [ref=e67]:
+        - generic [ref=e68]: TTFB headers
+        - generic [ref=e69]: 100.3 ms
+      - generic [ref=e70]:
+        - generic [ref=e71]: TTFB first chunk
+        - generic [ref=e72]: 746.1 ms
+      - generic [ref=e73]:
+        - generic [ref=e74]: TTFB first audible
+        - generic [ref=e75]: 756.3 ms
+      - generic [ref=e76]:
+        - generic [ref=e77]: Total net time
+        - generic [ref=e78]: 8.096 s
+      - generic [ref=e79]:
+        - generic [ref=e80]: Bytes received
+        - generic [ref=e81]: 353,280
+      - generic [ref=e82]:
+        - generic [ref=e83]: Audio seconds
+        - generic [ref=e84]: 7.360 s
+      - generic [ref=e85]:
+        - generic [ref=e86]: RTF (time/audio)
+        - generic [ref=e87]: "1.100"
+      - generic [ref=e88]:
+        - generic [ref=e89]: Realtime x
+        - generic [ref=e90]: "0.909"
+      - generic [ref=e91]:
+        - generic [ref=e92]: Queue depth
+        - generic [ref=e93]: 16.0 ms
+      - generic [ref=e94]:
+        - generic [ref=e95]: Throughput
+        - generic [ref=e96]: 42.6 KiB/s
+      - generic [ref=e97]:
+        - generic [ref=e98]: Signal peak
+        - generic [ref=e99]: "0.6914"
+    - paragraph [ref=e100]: Playback is scheduled progressively via Web Audio from streaming PCM bytes (not buffered-until-end).

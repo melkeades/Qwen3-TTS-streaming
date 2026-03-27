@@ -22,7 +22,7 @@ They share the same high-level goal: expose a local Qwen3-TTS model through Open
 Important distinction:
 
 - The base bridge is mostly stateless per request.
-- The custom bridge supports multi-model loading, speaker discovery, and backend text-session buffering.
+- The custom bridge supports multi-model loading, speaker discovery, backend text-session buffering, and a live websocket append-text session for CustomVoice.
 
 ## Files That Matter
 
@@ -62,7 +62,7 @@ The bridge has three layers:
    - validates requests
    - exposes endpoints
    - tracks active streams
-   - returns chunked PCM/WAV responses
+   - returns chunked PCM/WAV responses or websocket `audio.delta` events
 
 2. Runtime layer
    - stores mutable server state
@@ -93,6 +93,7 @@ CustomVoice-only endpoints:
 - `POST /v1/models/select`
 - `POST /v1/models/unload`
 - `POST /v1/audio/session/clear`
+- `WS /v1/audio/speech/live`
 
 ## Base Bridge
 
