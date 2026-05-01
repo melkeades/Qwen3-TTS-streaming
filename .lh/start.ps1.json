@@ -1,0 +1,18 @@
+{
+    "sourceFile": "start.ps1",
+    "activeCommit": 0,
+    "commits": [
+        {
+            "activePatchIndex": 0,
+            "patches": [
+                {
+                    "date": 1775380187785,
+                    "content": "Index: \n===================================================================\n--- \n+++ \n"
+                }
+            ],
+            "date": 1775380187785,
+            "name": "Commit-0",
+            "content": "$env:TORCHINDUCTOR_CACHE_DIR=\"d:\\torch_cache\"\r\n$env:TRITON_CACHE_DIR=\"d:\\triton_cache\"\r\n.\\.venv\\Scripts\\python -m openai_bridge.run_custom_bridge"
+        }
+    ]
+}

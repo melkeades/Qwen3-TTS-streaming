@@ -2,6 +2,8 @@ __pycache__/
 *.py[cod]
 *$py.class
 *.so
+.DS_Store
+Thumbs.db
 .Python
 build/
 develop-eggs/
@@ -24,4 +26,5 @@ venv/
 env/
 output/
 artifacts/
+.playwright-cli/
 custom_bridge/logs/*.log
